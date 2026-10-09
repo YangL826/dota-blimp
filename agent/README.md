@@ -54,9 +54,9 @@ run_analyst.bat --dry-run
 不调模型，只打印 system prompt 和工具列表，确认框架本身没问题。
 
 ### 6. 实战
-双击 `run_analyst.bat`（分析最新的 death），或指定文件夹：
+双击 `run_analyst.bat`（分析最新的 death），或指定文件夹（在 agent 目录下执行）：
 ```
-..\dota_automaton\.venv\Scripts\python.exe analyst.py 203238_death
+"..\..\dota_automaton\.venv\Scripts\python.exe" analyst.py 203238_death
 ```
 运行时每一步都会打印：模型在想什么、调了什么工具、返回了什么。
 报告存到 `agent/reports/`。
@@ -73,12 +73,17 @@ run_analyst.bat --dry-run
 - 工具层容错 → `tools.execute` 把报错转成文字喂回模型，而不是崩溃
 - 兜底 → 模型忘调 `write_report` 时自动存一份，不丢结论
 
-## 下一步（阶段 2 预告）
+## 下一步（阶段 2：执行者）✅ 已实现
 
-分析师跑稳之后，再加：
-- `write_file` 工具（带自动备份，只能写 `analysis/work.py`）
-- `run_command` 工具（白名单：只允许 `python -m py_compile` 和 `test_harness.py`）
-- prompt 里加"测试门"条款：errors:0 才能算改完
-- 复制成 `blimp_bot.py` 之前必须人工确认（human-in-the-loop）
+分析师跑稳之后，`executor.py` 把它升级成"能改代码、能跑测试"的执行者：
 
-阶段 2 的改动也都会放在这个 `agent/` 文件夹里，原项目结构依然不动。
+```
+双击 run_executor.bat [death文件夹名]   # 分析死因 → 改 analysis/work.py → 过测试门 → 写报告
+```
+
+- **改代码的手**：`edit_file`（精准替换，首选）/ `write_file`（全量重写），只能动 `analysis/work.py`，每次写自动备份旧版。
+- **测试门**：`run_command` 白名单只有两条——`python -m py_compile analysis/work.py` 和 `python analysis/harness/test_harness.py analysis/work.py`，`errors: 0` 才算过。其他命令一律拒绝。
+- **人工确认（human-in-the-loop）**：executor 永远不碰 `blimp_bot.py`。你看完报告确认没问题，双击 `run_promote.bat`：自动备份旧 `blimp_bot.py` → 复制 `work.py` 过去 → bot 热更新开下一局。
+
+完整一局的循环就是：
+`run_bot.bat` 跑 → 死亡 → `run_watcher.bat` 打包（或直接）→ `run_executor.bat` 分析+改+测 → 你看报告 → `run_promote.bat` 上线 → 下一局。

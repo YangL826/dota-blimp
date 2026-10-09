@@ -1,0 +1,11 @@
+# API key！绝不能提交到 GitHub
+config.json
+# 运行产物：打包的 death zip、分析报告
+outbox/
+reports/
+# Python 缓存
+__pycache__/
+*.pyc
+# 系统文件
+.DS_Store
+Thumbs.db

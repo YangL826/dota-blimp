@@ -1,0 +1,12 @@
+{
+  "left": 486,
+  "top": 128,
+  "right": 1423,
+  "bottom": 1062,
+  "shoot": true,
+  "deadzone": 6,
+  "hspeed": 400,
+  "gravity": 1182,
+  "jump_v": 778,
+  "timescale": 1.0
+}

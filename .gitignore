@@ -1,0 +1,18 @@
+# 运行数据（大，别进仓库）
+deaths/
+live/
+frames/
+agent/outbox/
+agent/reports/
+# 日志和备份
+bot_log.txt
+bot_log_old.txt
+*.bak_*
+*.zip
+# API key！绝不能提交
+agent/config.json
+# Python 缓存和系统文件
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

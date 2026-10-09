@@ -13,6 +13,7 @@ TOOL_SCHEMAS 是分析师的工具集；EXECUTOR_SCHEMAS 在此基础上加了
 """
 import base64
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,12 +27,25 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 MAX_RESULT_CHARS = 15000
 # 写文件的白名单：只能动这一个文件
 WRITABLE = {"analysis/work.py"}
+# 工作笔记本：每轮运行时 runner 会清空，模型用 write_note/read_notes 读写。
+# 它是独立文件，不会被 trim_history 裁掉——专治"失忆循环"。
+NOTES_FILE = None
+NOTES_MAX_CHARS = 20000
 
 
 def init(project_root, agent_dir):
-    global PROJECT_ROOT, AGENT_DIR
+    global PROJECT_ROOT, AGENT_DIR, NOTES_FILE
     PROJECT_ROOT = os.path.abspath(project_root)
     AGENT_DIR = os.path.abspath(agent_dir)
+    NOTES_FILE = os.path.join(AGENT_DIR, "working", "notes.md")
+
+
+def clear_notes():
+    """每轮运行开始时清空笔记本。"""
+    if NOTES_FILE:
+        os.makedirs(os.path.dirname(NOTES_FILE), exist_ok=True)
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            f.write("")
 
 
 def _safe(path, base):
@@ -124,6 +138,48 @@ def do_write_report(filename, content):
     return f"报告已保存：{p}"
 
 
+def _safe_key(key):
+    return (key or "").strip().replace("\n", " ")[:60] or "未命名"
+
+
+def do_write_note(key, content):
+    """工作笔记本：记下已确认的事实（读过的文件、关键证据、死因假设、当前计划）。
+    同一个 key 重复写会覆盖旧内容。笔记本是独立文件，不会被历史裁剪丢掉。"""
+    if NOTES_FILE is None:
+        return "笔记本还没初始化（runner 会在每轮开始时准备好）"
+    key = _safe_key(key)
+    content = (content or "").strip()
+    if not content:
+        return "拒绝：内容为空，不记"
+    os.makedirs(os.path.dirname(NOTES_FILE), exist_ok=True)
+    old = ""
+    if os.path.isfile(NOTES_FILE):
+        with open(NOTES_FILE, encoding="utf-8", errors="replace") as f:
+            old = f.read()
+    entry = f"## {key}\n{content}\n"
+    pattern = re.compile(r"^## " + re.escape(key) + r"\s*\n(.*?)(?=^## |\Z)",
+                         re.M | re.S)
+    if pattern.search(old):
+        new = pattern.sub(entry, old)
+    else:
+        new = old + ("\n" if old and not old.endswith("\n") else "") + entry
+    if len(new) > NOTES_MAX_CHARS:
+        return (f"拒绝：笔记本已满（{len(new)}>{NOTES_MAX_CHARS} 字）。"
+                "用更短的话重写旧笔记，或精简后再记。")
+    with open(NOTES_FILE, "w", encoding="utf-8") as f:
+        f.write(new)
+    return f"已记入笔记本：{key}（{len(content)} 字）"
+
+
+def do_read_notes():
+    """读工作笔记本。读文件/图片之前先查它——记过的东西不许重复读。"""
+    if NOTES_FILE is None or not os.path.isfile(NOTES_FILE):
+        return "（笔记本是空的，还没记任何东西）"
+    with open(NOTES_FILE, encoding="utf-8", errors="replace") as f:
+        text = f.read().strip()
+    return text or "（笔记本是空的，还没记任何东西）"
+
+
 # ---------- 阶段 2 新增：受控的写与执行 ----------
 
 def do_write_file(path, content):
@@ -204,6 +260,8 @@ TOOL_FUNCS = {
     "list_dir": do_list_dir,
     "read_image": do_read_image,
     "write_report": do_write_report,
+    "write_note": do_write_note,
+    "read_notes": do_read_notes,
     "write_file": do_write_file,
     "edit_file": do_edit_file,
     "run_command": do_run_command,
@@ -235,6 +293,13 @@ TOOL_SCHEMAS = [
     _schema("read_image", "查看一张 death 截图（jpg/png），直接看图分析敌人和平台位置。一次看一张，只挑关键帧看。",
             {"path": {"type": "string", "description": "相对项目根目录的图片路径，如 'deaths/203238_death/123.456.jpg'"}},
             ["path"]),
+    _schema("write_note", "工作笔记本：把已确认的事实立刻记下来（读过的文件清单、关键证据、死因假设、当前计划），防止历史被裁剪后失忆。调 read_file/read_image 前先用 read_notes 查，记过的东西不许重复读。同一个 key 重复写会覆盖旧内容。",
+            {"key": {"type": "string", "description": "短标题，如 '已读文件'、'死因假设'、'计划'"},
+             "content": {"type": "string", "description": "要记的内容，简明扼要"}},
+            ["key", "content"]),
+    _schema("read_notes", "读工作笔记本。每次读文件/图片/列目录之前先读它——已经记下来的东西不许再读一遍。",
+            {},
+            []),
     _schema("write_report", "把最终报告（Markdown 中文）保存到 agent/reports/。任务完成前必须调用一次。",
             {"filename": {"type": "string", "description": "文件名，如 '203238_death_report.md'，必须 .md 结尾"},
              "content": {"type": "string", "description": "报告正文（Markdown，中文）"}},

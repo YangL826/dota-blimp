@@ -90,11 +90,22 @@ def to_tool_messages(call_id, result):
     return [{"role": "tool", "tool_call_id": call_id, "content": str(result)}]
 
 
+def _pause_if_console():
+    """防闪退：双击 bat 运行时等用户按回车；输出被重定向到文件时不等待
+    （否则窗口会像卡住一样停在那里等一个看不见的按键）。"""
+    if sys.stdout.isatty():
+        try:
+            input("按回车退出…")
+        except EOFError:
+            pass
+
+
 def run(cfg, system_prompt, task_message, schemas, report_key=""):
     """跑一轮 ReAct。cfg 里没有 executor 小节时，沿用 analyst 的 limits。"""
     agent_dir = os.path.dirname(os.path.abspath(__file__))
     project = cfg["project_root"]
     tools.init(project, agent_dir)
+    tools.clear_notes()  # 每轮清空工作笔记本
 
     mc = ModelClient(**cfg["model"])
     limits = cfg.get("executor", cfg.get("analyst", {}))
@@ -108,6 +119,8 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
 
     final_text = ""
     trace = []  # 每步一句话摘要：崩溃时存成 partial 报告，分析过程不丢
+    call_counts = {}   # (工具名, 参数JSON) -> 累计次数：抓"非连续"的重复调用
+    warned_sigs = set()  # 已经提醒过的签名，不重复提醒
     try:
         for step in range(1, max_steps + 1):
             trim_history(messages, budget)
@@ -140,6 +153,19 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
                     preview = str(result)[:200].replace("\n", " ")
                 print(f"  返回（{ms}ms）：{preview}")
                 messages.extend(to_tool_messages(c["id"], result))
+                # 循环熔断器：同一个工具+同样参数累计调 4 次还没进展，说明在打转
+                sig = (c["name"], json.dumps(c["arguments"], sort_keys=True,
+                                            ensure_ascii=False))
+                call_counts[sig] = call_counts.get(sig, 0) + 1
+                if call_counts[sig] == 4 and sig not in warned_sigs:
+                    warned_sigs.add(sig)
+                    print("  ⚠ 重复调用 4 次，注入提醒")
+                    messages.append({
+                        "role": "user",
+                        "content": (f"⚠ 重复调用提醒：你已经用完全相同的参数调用了 {c['name']} 共 4 次，"
+                                    "返回的内容没有变化，你正在原地打转。立刻用 read_notes 查看笔记本里"
+                                    "已确认的事实，然后换思路推进（读代码找逻辑、看别的证据、收敛写报告）。"
+                                    "不要再重复这次调用。")})
             trace.append(
                 "### 步骤 %d\n%s\n工具：%s\n" % (
                     step, (text or "")[:400],
@@ -164,17 +190,23 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
                 print(f"（partial 报告保存失败：{se}）")
         print("请检查 config.json 里 model.base_url / api_key / model 是否正确，")
         print("接口需要是 OpenAI-compatible 的 chat/completions。")
+        _pause_if_console()
         raise SystemExit(1)
 
-    # 兜底：如果模型忘了调 write_report，把它的最终结论也存一份，不丢东西
+    # 兜底：如果模型忘了调 write_report，把最后的输出和步骤回放也存一份，不丢东西
     if report_key:
         reports = os.path.join(agent_dir, "reports")
         existing = set(os.listdir(reports)) if os.path.isdir(reports) else set()
-        if not any(report_key in f for f in existing) and final_text:
+        if not any(report_key in f for f in existing) and (final_text or trace):
             os.makedirs(reports, exist_ok=True)
             p = os.path.join(reports, f"{report_key}_report_unsaved.md")
             with open(p, "w", encoding="utf-8") as f:
-                f.write(final_text)
-            print(f"模型没有调用 write_report，已把它的最终结论存为 {p}")
+                f.write(f"# {report_key} —— 未正常结束时的抢救记录\n\n")
+                if final_text:
+                    f.write(f"## 模型最后的输出\n\n{final_text}\n\n")
+                if trace:
+                    f.write("## 步骤回放（每步摘要）\n\n" + "\n".join(trace) + "\n")
+            print(f"模型没有调用 write_report，已把抢救记录存为 {p}")
 
     print("\n完成。报告在 agent/reports/ 目录下。")
+    _pause_if_console()

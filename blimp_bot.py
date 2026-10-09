@@ -154,6 +154,7 @@ def perceive(img, col, s):
     PLAYER_LAST[0] = player if player is not None else PLAYER_LAST[0]
 
     plats, enemies = [], []
+    PILLARS.clear()
     green = cv2.inRange(hsv, (42, 90, 80), (52, 170, 170))
     blue = cv2.inRange(hsv, (100, 130, 170), (108, 200, 230))
     cloud = cv2.inRange(hsv, (0, 0, 205), (179, 45, 255))
@@ -167,8 +168,15 @@ def perceive(img, col, s):
                 pieces.append([x, x + w, y])
                 continue
             if kind in ("g", "b") and h >= 35*s and w >= 30*s:
-                boxes.append((x, y, w, h))
                 inner_red = int((red[y + int(h*0.15):y + int(h*0.85), x + int(w*0.15):x + int(w*0.85)] > 0).sum())
+                if h > 2.0*w and inner_red > 30*s*s:
+                    # 弹簧柱：又高又窄、带红色标记的柱子，侧面碰到/踩顶都会往上弹——不是尖刺箱！
+                    # 不进 enemies（否则 bot 会躲它）；记到 PILLARS 供脱困时主动去蹭；
+                    # 同时进 boxes，让小丑识别跳过柱身上的红色标记（否则误报小丑）。
+                    PILLARS.append((x, x + w, y, y + h))
+                    boxes.append((x, y, w, h))
+                    continue
+                boxes.append((x, y, w, h))
                 if inner_red > 30*s*s:
                     # 红叉箱子：顶上有刺，哪个方向都不能碰，也不能踩
                     y_top = y - 0.45*h; hh = h + 0.45*h
@@ -529,6 +537,7 @@ def choose(player, vy_up, plats, enemies, col, s, prev_target, stuck=False):
     return res
 
 CANDS = []
+PILLARS = []   # 弹簧柱 [(x0, x1, y_top, y_bottom)]，脱困时主动去蹭
 
 def _choose(player, vy_up, plats, enemies, col, s, prev_target, stuck, eventual, tilde_bad, up_ref=None):
     """vy_up: 世界坐标向上速度(px/s，正=上升)。返回 (目标x或None, 目标平台)"""
@@ -872,7 +881,7 @@ def main():
     def tl(): cfg["left"], cfg["top"] = cursor(); save(); print("左上角", cfg["left"], cfg["top"])
     def br(): cfg["right"], cfg["bottom"] = cursor(); save(); print("右下角", cfg["right"], cfg["bottom"], "已保存")
     def tog():
-        st["run"] = not st["run"]; print("▶ 运行（按键 A/D 移动, W 射击）" if st["run"] else "⏸ 暂停")
+        st["run"] = not st["run"]; print("[>] 运行（按键 A/D 移动, W 射击）" if st["run"] else "[||] 暂停")
         if not st["run"]: release_all()
     def tshoot(): cfg["shoot"] = not cfg["shoot"]; save(); print("自动射击:", "开" if cfg["shoot"] else "关")
     keyboard.add_hotkey("f8", tl); keyboard.add_hotkey("f9", br); keyboard.add_hotkey("f6", tog)
@@ -971,7 +980,7 @@ def main():
           try:
             now_ = time.time()
             if auto_start and now_ > auto_start:
-                st["run"] = True; auto_start = None; log("▶ 自动开始")
+                st["run"] = True; auto_start = None; log("[>] 自动开始")
             if now_ - last_mcheck > 2.0:
                 last_mcheck = now_
                 try:
@@ -1002,7 +1011,7 @@ def main():
             if not fg[0]:
                 release_all(); flush_taps(1e18)
                 if t - fg[3] > 5:
-                    fg[3] = t; log(f"⚠ 游戏窗口不在最前面（当前：{fg[2][:30]}），暂停操作，等你点回游戏窗口")
+                    fg[3] = t; log(f"[!] 游戏窗口不在最前面（当前：{fg[2][:30]}），暂停操作，等你点回游戏窗口")
                 time.sleep(0.1); continue
             hsv = None
             if col is None or fps_n % 60 == 0:
@@ -1021,7 +1030,7 @@ def main():
                         ever_alive = False
                     key_tap("space"); last_space = t; log("按空格开局")
                 elif AUTO and ever_alive and t - last_log > 10.0:
-                    log("⏸ 已死亡，等待 Claude 分析改进…"); last_log = t
+                    log("[||] 已死亡，等待 Claude 分析改进…"); last_log = t
                 release_all(); time.sleep(0.5)
                 if st["dump"]: cv2.imwrite(os.path.join(HERE, "debug.png"), img); st["dump"] = False
                 continue
@@ -1071,7 +1080,7 @@ def main():
                         ever_alive = False
                     key_tap("space"); last_space = t; log("按空格开局")
                 elif AUTO and ever_alive and t - last_log > 10.0:
-                    log("⏸ 已死亡，等待 Claude 分析改进…"); last_log = t
+                    log("[||] 已死亡，等待 Claude 分析改进…"); last_log = t
             if st.get("save"):
                 dump_buf("manual"); st["save"] = False
 
@@ -1164,7 +1173,7 @@ def main():
             hk_ = "right" if dirn_ > 0 else "left"
             if dirn_ and held_since[hk_] is not None and t - held_since[hk_] > 0.5 and pvx[0] * dirn_ < -150*s:
                 if t - fg[3] > 5:
-                    fg[3] = t; log("⚠ 按住的方向和实际移动相反：按键可能没进游戏（窗口焦点？）")
+                    fg[3] = t; log("[!] 按住的方向和实际移动相反：按键可能没进游戏（窗口焦点？）")
 
             # 敌人速度预测（小丑会跟着移动平台走、乌鸦会飞）：用 0.3 秒后的位置一起判断
             moving = []; moving_long = []
@@ -1185,7 +1194,7 @@ def main():
             stuck = t - prog[1] > 3.0
             STUCK_SOFT[0] = t - prog[1] > 2.0
             if stuck and not prog[2]:
-                log("⚠ 3 秒没往上爬，进入脱困模式"); prog[2] = True
+                log("[!] 3 秒没往上爬，进入脱困模式"); prog[2] = True
             if not stuck: prog[2] = False
             if prev_target is not None:      # 相机滚动后，上一帧目标的 y 要跟着平移才能对上
                 prev_target = (prev_target[0], prev_target[1], prev_target[2] + getattr(vt, "last_scroll", 0.0)) + tuple(prev_target[3:])
@@ -1244,8 +1253,36 @@ def main():
                 mode = "躲"
                 if threat >= 0: hold("right", False); hold("left", True)
                 else: hold("left", False); hold("right", True)
+            elif stuck and PILLARS:
+                # 脱困：主动去蹭最近弹簧柱的侧面（碰到就往上弹），打破原地弹跳死循环。
+                # 躲避（threat）分支在前，优先级不变；弹起开始爬升后 stuck 自动解除。
+                _pl0, _pl1 = min(PILLARS, key=lambda p: abs(wrap_dx(player[0], (p[0] + p[1]) / 2, col)))[:2]
+                _pdx = wrap_dx(player[0], (_pl0 + _pl1) / 2, col)
+                mode = "柱"
+                if _pdx > 30 * s:
+                    hold("left", False); hold("right", True)
+                elif _pdx < -30 * s:
+                    hold("right", False); hold("left", True)
+                else:
+                    release_all()
             elif tgt is None:
-                release_all()
+                _fb = [p for p in plats if "!" not in p[3]] or plats
+                if _fb:
+                    # 无候选兜底：一般是掉到所有平台下方（下落时脚上方平台全被过滤）。
+                    # release_all 等于松手等死；改为朝最近平台的横向位置靠拢——
+                    # 万一中途弹起（复跳/弹簧），横向已对准才有机会落回去。
+                    # 躲避（threat）分支在前，这里只处理无威胁 + 无目标的情况。
+                    _fx0, _fx1 = min(_fb, key=lambda p: abs(wrap_dx(player[0], (p[0] + p[1]) / 2, col)))[:2]
+                    _fdx = wrap_dx(player[0], (_fx0 + _fx1) / 2, col)
+                    mode = "寻"
+                    if _fdx > 30 * s:
+                        hold("left", False); hold("right", True)
+                    elif _fdx < -30 * s:
+                        hold("right", False); hold("left", True)
+                    else:
+                        release_all()
+                else:
+                    release_all()
             else:
                 prev_target = tgt
                 # 横向是一阶系统：现在松手，落地那一刻会滑到哪？落在落脚区间里就松手，不够就按住，冲过头就反向

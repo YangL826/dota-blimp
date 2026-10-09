@@ -30,4 +30,7 @@ analysis/work_bak_*.py
 fix_*.py
 analysis/patch_*.py
 nogame.jpg
+analysis/f*.jpg
+analysis/p*.png
+
 

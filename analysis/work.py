@@ -1200,7 +1200,10 @@ def main():
                 prev_target = (prev_target[0], prev_target[1], prev_target[2] + getattr(vt, "last_scroll", 0.0)) + tuple(prev_target[3:])
             tgt = choose(player, vy_up, plats, enemies + moving_long, col, s, None if stuck else prev_target, stuck)
             if stuck and tgt is None:
-                tgt = choose(player, vy_up, plats, enemies + moving_long, col, s, None, False)
+                # 脱困时第一轮(stuck=True)已过滤掉自身/更低平台, 若无更高可达则保持 None
+                # 进入"寻"模式(向最近平台靠), 不再回退到 stuck=False 重选回原地
+                # (041603: 回退会选回 298-350@829 原地空跳 7.6 秒直至偏出踩空)
+                tgt = None
             # 躲避：不能从下面/侧面碰到敌人；从上往下踩没事
             g_px = cfg["gravity"] * s * cfg.get("timescale", 1.0) ** 2
             ptop, pbot = player[1] - 68*s, player[1]          # 整个身体：脚底往上约 68px

@@ -75,14 +75,15 @@ def load_state():
             for k, v in {"seen_deaths": [], "no_change_streak": 0,
                          "fail_streak": 0, "bad_games": 0, "score_watch": 0,
                          "watch_scores": [], "last_promote_commit": None,
-                         "baseline": None, "games": 0}.items():
+                         "baseline": None, "games": 0, "bot_pid": None}.items():
                 st.setdefault(k, v)
             return st
         except Exception as e:
             log(f"[!] loop_state.json 读失败（{e}），用空状态重建")
     return {"seen_deaths": [], "no_change_streak": 0, "fail_streak": 0,
             "bad_games": 0, "score_watch": 0, "watch_scores": [],
-            "last_promote_commit": None, "baseline": None, "games": 0}
+            "last_promote_commit": None, "baseline": None, "games": 0,
+            "bot_pid": None}
 
 
 def save_state(st):
@@ -185,6 +186,19 @@ def stop_bot(proc):
             except Exception:
                 pass
         log("[OK] bot 已停止")
+
+
+def restart_bot_for_next_game(st, bot):
+    """处理完一次死亡后重启 bot，开始下一局。返回新进程（失败则熔断）。"""
+    stop_bot(bot)
+    log("上一局处理完毕，重启 bot 开始下一局…")
+    new_bot = start_bot()
+    if new_bot is None:
+        save_state(st)
+        alert("bot 重启失败，下一局无法开始", None)
+    st["bot_pid"] = new_bot.pid
+    save_state(st)
+    return new_bot
 
 
 # ---------- 死亡检测 ----------
@@ -492,7 +506,7 @@ def handle_death(death, st, bot):
         if st["fail_streak"] >= LOOP_CFG["max_fail_streak"]:
             alert(f"executor 连续 {st['fail_streak']} 次异常退出，"
                   f"日志见 loop_executor_{death}.log", bot)
-        return bot
+        return restart_bot_for_next_game(st, bot)
 
     # 4) 有改动 → 独立过测试门 → promote → 提交 → 重启
     if changed:
@@ -531,6 +545,7 @@ def handle_death(death, st, bot):
         bot = start_bot()
         if bot is None:
             alert("promote 后 bot 重启失败", None)
+        st["bot_pid"] = bot.pid
         log(f"[OK] bot 已重启，新代码生效。观察接下来 {st['score_watch']} 局。")
         return bot
 
@@ -548,7 +563,7 @@ def handle_death(death, st, bot):
         log(f"[!] executor 无改动也无报告，连续失败 {st['fail_streak']} 次")
         if st["fail_streak"] >= LOOP_CFG["max_fail_streak"]:
             alert(f"executor 连续 {st['fail_streak']} 次无产出", bot)
-    return bot
+    return restart_bot_for_next_game(st, bot)
 
 
 # ---------- 主循环 ----------
@@ -634,10 +649,17 @@ def main():
               None)
     elif r is None:
         log("[!] 查不到进程列表（wmic 不可用），跳过防双开检查")
+    if st.get("bot_pid"):
+        log(f"[!] 上次运行的 bot 进程 pid={st['bot_pid']} 可能还残留；"
+            f"如重启后行为异常，请在任务管理器里确认旧 python.exe 已结束")
+        st["bot_pid"] = None
+        save_state(st)
 
     bot = start_bot()
     if bot is None:
         alert("bot 启动失败，请检查 blimp_bot.py", None)
+    st["bot_pid"] = bot.pid
+    save_state(st)
 
     log("进入主循环。停止：关窗口或 Ctrl+C。")
     try:

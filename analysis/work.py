@@ -108,6 +108,12 @@ def blobs(mask, min_area=20, half=False):
 SPIKE_MEM = []
 UPS = []
 STUCK_SOFT = [False]
+DESPERATE = [0.0]     # 卡住的秒数（没卡到 8 秒时为 0）。卡在死胡同里没有意义（用户看到卡半分钟会手动结束这局），卡住超过 8 秒就允许冒险的落点
+CUT_Z = set()         # 本帧“敌人正下方”的危险区（放在 SPIKES 里，但它跟着敌人、不跟着移动平台走：不能按平台速度外扩）
+PILLAR_H = 96         # 柱子高约 96~100px（实测）。碰到柱子侧面也能弹起（用户确认），所以柱顶往下 84px 内都算能落
+EV_GRAPH = {"nodes": [], "best": {}}   # plan_eventual 的节点和结果（选点时算“碰柱子侧面”那种落点的后续高度用）
+SPIKE_MOT = {}        # 移动平台上的刺：外扩后的条目 -> (原 x0, 原 x1, 横向速度)，躲刺时按落下那一刻刺的位置算
+CUT_SRC = []          # 本帧因为头顶有敌人被切掉过的平台：(x0, x1, top, kind, [敌人])，冒险模式下按“能不能躲开”重新算可落区间
 DODGE_DIR = [0] # 躲避方向迟滞：+1=往左躲，-1=往右躲，0=没在躲（防乌鸦贴脸时方向抖动）
 SUPPORT = [None]   # 上次起跳的平台顶（当前屏幕坐标）
 DBG = []          # 本帧所有候选落点（写进死亡记录，方便事后分析）
@@ -116,6 +122,22 @@ PLAT_V = {}      # 移动平台（蓝色/云）的横向速度估计
 PHYS = {"vx": 0.0, "a": None, "vmax": None}   # 角色横向速度、加速度、最大速度（在线估计，单位按当前画面像素）
 SPIKES = []      # 本帧所有尖刺 (x0, x1, 平台顶)
 SEG_PARENT = {}  # 带刺平台切出来的落脚段 -> 整块平台的 (x0, x1)（预测移动平台碰边反弹要用整块的宽度）
+SCREEN = {"h": None, "sy": None}   # 画面高度、滚屏线（角色上升时脚的屏幕 y 被锁在这条线上，实测 ≈ 0.603·画面高）
+
+def cut_hz(e, top, kind, s, base):
+    """平台上方的敌人 e 在这块平台上划出的危险区半宽（以敌人中心为准）：敌人半宽 + base。
+    敌人离平台越高，弹起后头碰到它之前能横移躲开得越多，危险区越窄；头根本碰不到它时返回 0。弹簧/火箭不减（冲得太快躲不开）"""
+    hz = e[2]/2 + base
+    r = (top - (e[1] + e[3]/2)) - 75*s
+    if "*" in kind or r <= 0:
+        return hz
+    ts = cfg.get("timescale", 1.0)
+    vj = cfg["jump_v"] * s * ts; g = cfg["gravity"] * s * ts * ts
+    if vj * vj <= 2 * g * r:
+        return 0.0
+    te = max(0.0, (vj - np.sqrt(vj * vj - 2 * g * r)) / g - 0.10)   # 认出弹起 + 按键生效留 0.1 秒
+    tau = cfg.get("htau", 0.167)
+    return hz - cfg.get("vmax", 485) * s * (te - tau * (1.0 - np.exp(-te / tau)))
 
 def perceive(img, col, s):
     """返回 player(x, feet_y) 或 None, platforms[(x0,x1,top,kind)], enemies[(cx,cy,w,h)]"""
@@ -154,7 +176,6 @@ def perceive(img, col, s):
     PLAYER_LAST[0] = player if player is not None else PLAYER_LAST[0]
 
     plats, enemies = [], []
-    PILLARS.clear()
     green = cv2.inRange(hsv, (42, 90, 80), (52, 170, 170))
     blue = cv2.inRange(hsv, (100, 130, 170), (108, 200, 230))
     cloud = cv2.inRange(hsv, (0, 0, 205), (179, 45, 255))
@@ -169,13 +190,6 @@ def perceive(img, col, s):
                 continue
             if kind in ("g", "b") and h >= 35*s and w >= 30*s:
                 inner_red = int((red[y + int(h*0.15):y + int(h*0.85), x + int(w*0.15):x + int(w*0.85)] > 0).sum())
-                if h > 2.0*w and inner_red > 30*s*s:
-                    # 弹簧柱：又高又窄、带红色标记的柱子，侧面碰到/踩顶都会往上弹——不是尖刺箱！
-                    # 不进 enemies（否则 bot 会躲它）；记到 PILLARS 供脱困时主动去蹭；
-                    # 同时进 boxes，让小丑识别跳过柱身上的红色标记（否则误报小丑）。
-                    PILLARS.append((x, x + w, y, y + h))
-                    boxes.append((x, y, w, h))
-                    continue
                 boxes.append((x, y, w, h))
                 if inner_red > 30*s*s:
                     # 红叉箱子：顶上有刺，哪个方向都不能碰，也不能踩
@@ -248,7 +262,7 @@ def perceive(img, col, s):
                 continue                                   # 角色自己身上的蓝色
             enemies.append((cx, cy, w + 12*s, h + 12*s, "balloon"))
 
-    # 气球（橄榄黄、会把人推开）：当敌人躲，但不打
+    # 气球（橄榄黄、会把人推开）：能踩当跳板；从下面/侧面撞上会被往下弹开（常常因此摔死，要躲）；能打破，但平时不打——只在它挡住唯一的路时打
     yel = cv2.inRange(hsv, (24, 130, 60), (34, 255, 230)) | cv2.inRange(hsv, (125, 80, 40), (165, 255, 230))
     yel[:top_cut] = 0; yel[:, :lx] = 0; yel[:, rx:] = 0
     for x, y, w, h, a in blobs(yel, int(500*s*s), half=True):
@@ -316,9 +330,12 @@ def perceive(img, col, s):
         if spike is None:
             marked.append((x0, x1, top, kind)); continue
         # 尖刺只占平台的一段：把两边没刺的部分留下来当落脚点
-        pad = (22*s) if kind[0] == "b" else (15*s)   # 刺边缘到脚的安全距离；移动平台上的刺会跟着动，留宽一点
+        # 刺边缘到落点中心的安全距离：脚宽约 ±20px + 控制误差；刺的识别边缘还会比实际窄几个像素
+        # （044721：落点离识别到的刺边 15px，脚还是踩上了刺）。移动平台上的刺会跟着动，再多留一点
+        pad = (32*s) if kind[0] == "b" else (28*s)
         SPIKES.append((x0 + spike[0], x0 + spike[1], top))
-        segs = [(x0, int(x0 + spike[0] - pad)), (int(x0 + spike[1] + pad), x1)]
+        ov = 12*s                                     # 脚可以伸出平台边一点照样弹起（实测伸出 26px 也行），落脚段往外延一点
+        segs = [(int(x0 - ov), int(x0 + spike[0] - pad)), (int(x0 + spike[1] + pad), int(x1 + ov))]
         segs = [(a_, b_) for a_, b_ in segs if b_ - a_ >= 12*s]
         if segs:
             for a_, b_ in segs:
@@ -338,6 +355,7 @@ def perceive(img, col, s):
     # 竖着的柱子（细长：两头绿色、中间金色箭头）：顶端可以当小落脚点。
     # 金色箭头和角色盔甲同色，所以先把角色盔甲那一块挖掉；两头必须有绿色（排除边框木纹）
     pil = cv2.inRange(hsv, (14, 85, 35), (46, 255, 215))
+    pil &= ~cv2.inRange(hsv, (10, 0, 120), (24, 110, 255))   # 米色边框不算：柱子贴着边框时会和边框连成一大长条被丢掉（030639/042421 卡死的原因）
     pil[:top_cut] = 0; pil[:, :lx] = 0; pil[:, rx:] = 0
     if pbox is not None:
         bx_, by_, bw_, bh_ = pbox; e_ = int(8*s)
@@ -361,15 +379,27 @@ def perceive(img, col, s):
     ts_ = cfg.get("timescale", 1.0)
     H_ = (cfg["jump_v"] * s * ts_) ** 2 / (2 * cfg["gravity"] * s * ts_ * ts_) + 80*s   # 跳到最高点时头顶（脚底往上约 75px）能碰到的高度
     cut = []
+    CUT_SRC.clear(); CUT_Z.clear()
     for (x0, x1, top, kind) in plats:
-        if kind == "j":
+        if kind == "j" or pillar_side(kind):
+            # 柱子不在这里切：碰柱子侧面时落点比柱顶低很多，弹起后离头顶的敌人更远、更来得及躲（06:28 卡住那局：
+            # 柱子在气球下面被整根切掉，其实从侧面碰上去、往右一躲就能踩旁边的气球上去）。选点时按实际落点高度判断
             cut.append((x0, x1, top, kind)); continue
         pieces = [(x0, x1)]
+        causes = []
         for e in enemies:
             ebot = e[1] + e[3]/2
-            if not (top - H_ < ebot < top + 5*s):
+            # 弹簧/火箭平台：会被弹得很高（火箭一路冲上去，躲都来不及——045454 就是坐火箭撞上了正上方的乌鸦）
+            if not (top - (900*s if "*" in kind else H_) < ebot < top + 5*s):
                 continue
-            b0, b1 = e[0] - e[2]/2 - 38*s, e[0] + e[2]/2 + 38*s     # 角色身体半宽约 35px（实测被小丑判定碰到时离识别框只有几个像素）
+            # 危险区半宽 = 敌人半宽 + 38（角色身体半宽约 35px，实测被小丑判定碰到时离识别框只有几个像素）；
+            # 敌人离平台越高，弹起后头碰到它之前能横移躲开的距离越多，危险区就窄一些（052546：云被高处的气球整块切掉，没地方落）
+            hz_ = cut_hz(e, top, kind, s, 38*s)
+            if hz_ <= 0:
+                continue
+            b0, b1 = e[0] - hz_, e[0] + hz_
+            if b1 > x0 and b0 < x1:
+                causes.append(e)
             nxt = []
             for a_, b_ in pieces:
                 if b_ <= b0 or a_ >= b1:
@@ -380,6 +410,7 @@ def perceive(img, col, s):
         if pieces == [(x0, x1)]:
             cut.append((x0, x1, top, kind))
         else:
+            CUT_SRC.append((x0, x1, top, kind, causes))
             for a_, b_ in pieces:
                 if b_ - a_ >= 16*s:
                     cut.append((int(a_), int(b_), top, kind + "^"))
@@ -387,10 +418,10 @@ def perceive(img, col, s):
             pos_ = x0
             for a_, b_ in sorted(pieces):
                 if a_ > pos_ + 1:
-                    SPIKES.append((int(pos_), int(a_), top))
+                    SPIKES.append((int(pos_), int(a_), top)); CUT_Z.add((int(pos_), int(a_), top))
                 pos_ = max(pos_, b_)
             if x1 > pos_ + 1:
-                SPIKES.append((int(pos_), int(x1), top))
+                SPIKES.append((int(pos_), int(x1), top)); CUT_Z.add((int(pos_), int(x1), top))
     plats = cut
     # 识别到的是橙色盔甲的下沿；实测真正的脚底还要再往下约 28 像素（录像里落地瞬间盔甲下沿比平台顶高 28px）
     if player is not None:
@@ -435,6 +466,116 @@ def time_to_cover(dx, v0, tau, vmax):
         t = nt
     return t
 
+def desp_pad(s):
+    """冒险模式下按多宽的身体半宽算碰撞：卡得越久越敢贴着敌人（卡死在原地等于这局结束）：8 秒 35px → 20 秒 22px"""
+    return max(22.0, 35.0 - 1.1 * max(0.0, DESPERATE[0] - 8.0)) * s
+
+def escape_parts(s):
+    """冒险模式用：被敌人切掉的平台，按“弹起后往外躲来得及”的区间重新给出落点（kind 带 x）。
+    敌人底边离平台越远，弹起后头碰到它之前横移得越多，危险区越窄；平台两头还能多落 14px（脚的判定比平台宽，实测 26px 内都能弹起）"""
+    out = []
+    ts = cfg.get("timescale", 1.0)
+    g = cfg["gravity"] * s * ts * ts; vj = cfg["jump_v"] * s * ts
+    V = PHYS["vmax"] or 470*s; tau = cfg.get("htau", 0.167)
+    for (x0, x1, top, kind, ens) in CUT_SRC:
+        if "*" in kind or "!" in kind or kind[0] in "bcj":
+            continue
+        oh = 0.0 if "~" in kind else 14*s
+        pieces = [(x0 - oh, x1 + oh)]
+        for e in ens:
+            r = (top - (e[1] + e[3]/2)) - 75*s          # 弹起后头顶（脚底往上 75px）要升多高才碰到敌人底边
+            if r <= 0:
+                d = 0.0
+            elif vj*vj <= 2*g*r:
+                continue
+            else:
+                tr = (vj - np.sqrt(vj*vj - 2*g*r)) / g
+                te = max(0.0, tr - 0.07)                 # 认出弹起 + 按键生效的延迟
+                d = V * (te - tau * (1.0 - np.exp(-te / tau)))
+            hz = e[2]/2 + desp_pad(s) - d
+            if hz <= 0:
+                continue
+            b0, b1 = e[0] - hz, e[0] + hz
+            nxt = []
+            for a_, b_ in pieces:
+                if b_ <= b0 or a_ >= b1:
+                    nxt.append((a_, b_)); continue
+                if a_ < b0: nxt.append((a_, b0))
+                if b_ > b1: nxt.append((b1, b_))
+            pieces = nxt
+        for a_, b_ in pieces:
+            if b_ - a_ >= 8*s:
+                out.append((int(a_), int(b_), top, kind[0] + ("~" if "~" in kind else "") + "x"))
+    return out
+
+def pillar_side(kind):
+    """能碰侧面弹起的柱子（不含带刺段、冒险段）"""
+    return kind[0] == "p" and "~" not in kind and "x" not in kind
+
+def scroll_pred(fy, vy_up, g):
+    """这一跳还会让画面往上滚多少：相机只往上走，脚高过滚屏线时画面跟着上移，所有平台整体往下移这么多"""
+    sy = SCREEN.get("sy")
+    if sy is None or vy_up <= 0:
+        return 0.0
+    apex = fy - vy_up * vy_up / (2 * g)
+    return max(0.0, sy - apex)
+
+def land_ok(top, scr, s):
+    """落地那一刻平台还在画面里（掉出画面底边 = 死）。有滚屏预测时多留余量（速度估计有误差）"""
+    h = SCREEN.get("h")
+    if h is None:
+        return True
+    return top + scr < h - ((40*s) if scr > 0 else (10*s))
+
+def first_hit(px, fy_w, vy, vx0, u, en, col, s, g, tmax=0.6, step=0.033):
+    """一直按 u（+1 右 / -1 左 / 0 松手）的话，tmax 秒内第一次碰到敌人的时间（不会碰到返回 None）。
+    en: [(cx, cy_world, w, h, kind, vx, vy_world)]，fy_w: 脚底的世界 y（越大越靠下），vy: 角色向上速度。
+    身体：脚底往上 72px、左右 ±30px。从上往下落到小丑/气球头顶（脚在它顶部 18px 以内）是踩，不算碰。"""
+    V = PHYS["vmax"] or 470*s; tau = cfg.get("htau", 0.167)
+    n = int(tmax / step)
+    y_prev = fy_w
+    for k in range(1, n + 1):
+        tt = k * step
+        x = px + u*V*tt + (vx0 - u*V)*tau*(1.0 - np.exp(-tt/tau))
+        y = fy_w - (vy*tt - 0.5*g*tt*tt)
+        falling = vy - g*tt < 0
+        for (ex, ey, ew, eh, kind, vxe, vye) in en:
+            exx = ex + vxe*tt; eyy = ey + vye*tt
+            ddx = abs(wrap_dx(x, exx, col))
+            if ddx < ew/2 + 30*s and y - 72*s < eyy + eh/2 and y > eyy - eh/2:
+                # 从上往下踩到头顶：会被弹起来，后面的轨迹就不是这条了。上一步脚还在它头顶上方也算
+                # （落得快时一步走 20 多像素，会跳过“脚在头顶 18px 以内”这一窄条——053240 把踩气球当成撞上，躲开后摔死）
+                top_ = eyy - eh/2
+                if falling and kind in ("clown", "jester", "balloon") and ddx < ew/2 + 5*s and \
+                        (y < top_ + 18*s or y_prev <= (ey + vye*(tt - step)) - eh/2 + 4*s):
+                    return None
+                return tt
+        y_prev = y
+    return None
+
+def traj_hits_enemy(px, fy, vy, vx0, dx, t_land, enemies, col, s, g, step=0.03, hw=None):
+    """从现在到落地（t_land 秒）的轨迹上，身体会不会碰到敌人。横向按“朝目标按住、到了就停”的一阶模型。"""
+    if not enemies or t_land <= 0:
+        return False
+    V = PHYS["vmax"] or 470*s; tau = cfg.get("htau", 0.167)
+    hw = 33*s if hw is None else hw
+    u = 1.0 if dx > 0 else (-1.0 if dx < 0 else 0.0)
+    n = int(t_land / step) + 1
+    for k in range(1, n + 1):
+        tt = min(k * step, t_land)
+        if u != 0.0:
+            disp = u*V*tt + (vx0 - u*V)*tau*(1.0 - np.exp(-tt/tau))
+            if (disp - dx) * u > 0:
+                disp = dx
+        else:
+            disp = vx0*tau*(1.0 - np.exp(-tt/tau))
+        x = px + disp
+        y = fy - (vy*tt - 0.5*g*tt*tt)          # 脚底（屏幕坐标，越大越靠下）
+        for e in enemies:
+            if abs(wrap_dx(x, e[0], col)) < e[2]/2 + hw and y - 75*s < e[1] + e[3]/2 and y > e[1] - e[3]/2:
+                return True
+    return False
+
 def reflect_move(x0, x1, v, t, lo, hi):
     """移动平台 t 秒后的位置：在 [lo, hi] 之间来回走、碰边反弹（不会穿框）"""
     w = x1 - x0
@@ -468,9 +609,22 @@ def node_danger(x0, x1, top, kind, enemies, s, jump_h):
         return True
     for e in enemies:
         if kind == "j":
+            # 踩敌人头：旁边/头顶紧挨着还有别的敌人（一串气球）就不算可用（和 _choose 的“严重危险”判定一致，
+            # 否则规划以为能踩着气球上去、选点时却不敢踩，结果把自己带进死胡同——045404）
+            if x0 - 20*s < e[0] < x1 + 20*s and top - 90*s < e[1] < top + 5*s:
+                return True
             continue
-        if (e[0] + e[2]/2 > x0 - 6*s) and (e[0] - e[2]/2 < x1 + 6*s) and top - jump_h < e[1] + e[3]/2 < top + 5*s:
-            return True
+        if "x" in kind:
+            continue
+        if top - jump_h < e[1] + e[3]/2 < top + 5*s:
+            if pillar_side(kind):
+                zh = cut_hz(e, top, kind, s, 35*s)
+                if zh > 0 and abs(e[0] - (x0 + x1) / 2) < zh:
+                    return True
+                continue
+            zh = cut_hz(e, top, kind, s, 6*s)
+            if zh > 0 and e[0] + zh > x0 and e[0] - zh < x1:
+                return True
     return False
 
 def plan_eventual(plats, enemies, col, s, depth=5, allow_risky=True):
@@ -481,42 +635,94 @@ def plan_eventual(plats, enemies, col, s, depth=5, allow_risky=True):
     vj = cfg["jump_v"] * s * ts
     H = vj * vj / (2 * g)
     tau_ = cfg.get("htau", 0.167); vm_ = (PHYS["vmax"] or 470*s) * cfg.get("reach_vfrac", 0.9)
-    nodes = [p for p in plats if not node_danger(p[0], p[1], p[2], p[3], enemies, s, H + 80*s)
-             and (allow_risky or "~" not in p[3])]
+    nodes = [p for p in plats if not node_danger(p[0], p[1], p[2], p[3], enemies, s, 900*s if "*" in p[3] else H + 80*s)
+             and (allow_risky or "~" not in p[3]) and land_ok(p[2], 0.0, s)]
     n = len(nodes)
     best = {}
     for p in nodes:
         bonus = 350*s if "*" in p[3] else 0.0          # 弹簧/火箭：能弹得高很多
-        best[p] = p[2] - bonus
-    succ = {p: [] for p in nodes}
-    for p in nodes:
+        # 白云、踩敌人头都是一次性的（云踩一次就消失，实测 10 次里 9 次；敌人被踩掉）：
+        # 落上去之后如果没有下一步可去，就只能往下掉——当成很差的死胡同，而不是“可以一直弹”的落脚点
+        once = 400*s if p[3][0] in "cj" else 0.0
+        best[p] = p[2] - bonus + once
+    succ = {}
+    allnodes = list(nodes)
+    queue = list(nodes)
+    # 碰侧面用的柱子：哪怕踩柱顶危险（头顶有敌人），从侧面低处弹起可能来得及躲开，所以单独列出来
+    pil_all = [q for q in plats if pillar_side(q[3]) and land_ok(q[2], 0.0, s) and q not in nodes]
+    while queue:
+        p = queue.pop(0)
+        succ[p] = []
         Hp = H * (2.2 if "*" in p[3] else 1.0)
         vjp = np.sqrt(2 * g * Hp)
-        for q in nodes:
-            if q is p:
+        scr_p = max(0.0, SCREEN["sy"] - (p[2] - Hp)) if SCREEN.get("sy") else 0.0
+        for q in nodes + pil_all:
+            if q == p:
                 continue
+            if not land_ok(q[2], scr_p, s):
+                continue                                   # 这一跳会把画面往上滚，q 落地时已经在画面底边外
+            if q not in nodes and not (p[2] - q[2] > H - 10*s):
+                continue                                   # 踩柱顶危险的柱子只能走“碰侧面”这条边
             dy = p[2] - q[2]                               # q 比 p 高多少
-            need_clear = 35*s if q[3] == "j" else 10*s     # 踩敌人头要先高过它
+            need_clear = 18*s if q[3] == "j" else 10*s     # 踩气球/敌人头：脚高过它头顶就行（用户确认），留 18px 余量横移上去
+            m_ = 6*s
+            if dy > Hp - need_clear and pillar_side(q[3]) and "*" not in p[3]:
+                # 跳不到柱顶，但最高点落在柱子高度范围内：碰柱子侧面也能弹起来（用户确认）→ 虚拟节点：在柱子半腰那个高度弹起
+                y_land = p[2] - Hp + 15*s
+                if not (q[2] - 8*s < y_land < q[2] + (PILLAR_H - 12)*s):
+                    continue
+                tq = (vjp + np.sqrt(max(0.0, vjp * vjp - 2 * g * (p[2] - y_land)))) / g
+                gap = span_gap(p[0] + m_, p[1] - m_, q[0] + 2*s, q[1] - 2*s, col)
+                if time_to_cover(gap, 0.0, tau_, vm_) <= tq - 0.1 and \
+                        not node_danger(q[0], q[1], y_land, q[3], enemies, s, H + 80*s):
+                    v = (q[0], q[1], int(y_land), q[3])
+                    if v not in best:
+                        if len(allnodes) > len(nodes) + 40:
+                            continue
+                        best[v] = float(y_land); allnodes.append(v); queue.append(v)
+                    succ[p].append(v)
+                continue
             if dy > Hp - need_clear or dy < -Hp:
                 continue
             tq = (vjp + np.sqrt(max(0.0, vjp * vjp - 2 * g * dy))) / g
-            m_ = 6*s
             gap = span_gap(p[0] + m_, p[1] - m_, q[0] + m_, q[1] - m_, col)
             if time_to_cover(gap, 0.0, tau_, vm_) <= tq - 0.1:
                 succ[p].append(q)
-    for _ in range(depth):
+    for _ in range(depth + 2):
         changed = False
-        for p in nodes:
-            for q in succ[p]:
+        for p in allnodes:
+            for q in succ.get(p, []):
                 if best[q] < best[p] - 0.5:
                     best[p] = best[q]; changed = True
         if not changed:
             break
+    EV_GRAPH["nodes"], EV_GRAPH["best"] = allnodes, best
     return best
+
+def ev_from(x0, x1, top, s, col):
+    """从 (x0, x1) 这块、在 top 这个高度弹起之后最终能爬多高（用 plan_eventual 的结果；碰柱子侧面那种落点用）"""
+    ts = cfg.get("timescale", 1.0)
+    g = cfg["gravity"] * s * ts * ts; vj = cfg["jump_v"] * s * ts; H = vj * vj / (2 * g)
+    tau_ = cfg.get("htau", 0.167); vm_ = (PHYS["vmax"] or 470*s) * cfg.get("reach_vfrac", 0.9)
+    best_ = EV_GRAPH["best"]; ev = float(top)
+    for q in EV_GRAPH["nodes"]:
+        dy = top - q[2]
+        if dy > H - (18*s if q[3] == "j" else 10*s) or dy < -H or (q[0] == x0 and q[1] == x1 and abs(q[2] - top) < 4*s):
+            continue
+        tq = (vj + np.sqrt(max(0.0, vj * vj - 2 * g * dy))) / g
+        gap = span_gap(x0 + 6*s, x1 - 6*s, q[0] + 6*s, q[1] - 6*s, col)
+        if time_to_cover(gap, 0.0, tau_, vm_) <= tq - 0.1:
+            ev = min(ev, best_.get(q, q[2]))
+    return ev
 
 def choose(player, vy_up, plats, enemies, col, s, prev_target, stuck=False):
     """先按“带刺平台算危险”选；如果干净的选择里没有一个能（不碰刺地）爬得比起跳平台更高，
     而带刺平台没刺的那段能往上走，就不再把带刺算危险，重新选一次（避免在底下干净平台上原地弹）"""
+    if DESPERATE[0]:
+        try:
+            plats = plats + escape_parts(s)
+        except Exception:
+            pass
     try:
         ev_any = plan_eventual(plats, enemies, col, s)
         ev_safe = plan_eventual(plats, enemies, col, s, allow_risky=False)
@@ -537,7 +743,6 @@ def choose(player, vy_up, plats, enemies, col, s, prev_target, stuck=False):
     return res
 
 CANDS = []
-PILLARS = []   # 弹簧柱 [(x0, x1, y_top, y_bottom)]，脱困时主动去蹭
 
 def _choose(player, vy_up, plats, enemies, col, s, prev_target, stuck, eventual, tilde_bad, up_ref=None):
     """vy_up: 世界坐标向上速度(px/s，正=上升)。返回 (目标x或None, 目标平台)"""
@@ -550,16 +755,33 @@ def _choose(player, vy_up, plats, enemies, col, s, prev_target, stuck, eventual,
     best, best_key = None, None
     stick, stick_key = None, None
     DBG.clear(); UPS.clear(); CANDS.clear()
+    sc_p = scroll_pred(fy, vy_up, g)
     for (x0, x1, top, kind) in plats:
         if "!" in kind:
             continue                       # 有尖刺
+        if not land_ok(top, sc_p, s):
+            continue                       # 落地时它已经被滚到画面底边外（050241、050621：追着滚出画面的柱子掉下去摔死）
         if up_ref is not None and top >= up_ref - 20*s:
             continue                       # 第二轮：只考虑比起跳平台高的
         if kind == "j" and vy_up <= 0 and fy > top - 40*s and abs(wrap_dx(px, (x0 + x1) / 2, col)) > (x1 - x0) / 2:
             continue                       # 已经在往下落、离它头顶很近却还没对准：来不及了，不踩
         j_below = kind == "j" and fy > top - 8*s
-        if j_below and not (vy_up > 0 and fy - vy_up*vy_up/(2*g) < top - 35*s):
+        if j_below and not (vy_up > 0 and fy - vy_up*vy_up/(2*g) < top - 18*s):
             continue                       # 踩敌人只能从头顶落下；人在下面、又跳不过它头顶时不以它为目标
+        side_ = False
+        if pillar_side(kind):
+            # 柱子：跳不到柱顶时，最高点要是落在柱子高度范围内，碰它侧面也能弹起来（用户确认）。
+            # 落点高度 = 横向赶到柱子那一刻脚的高度（至少在最高点下面一点，最低到柱顶下 84px）
+            apex_ = fy - (vy_up*vy_up / (2*g) if vy_up > 0 else 0.0)
+            bot_ = top + (PILLAR_H - 12) * s
+            if apex_ > top - 8*s and apex_ < bot_ - 4*s:
+                dxp_ = span_dx(px, x0, x1, col, (x1 - x0) * 0.5 - 1)
+                tn_ = time_to_cover(dxp_, PHYS["vx"], cfg.get("htau", 0.167), (PHYS["vmax"] or 470*s) * cfg.get("reach_vfrac", 0.9)) + 0.06
+                y_n = fy - (vy_up*tn_ - 0.5*g*tn_*tn_)
+                y_eff = max(top, apex_ + 15*s, y_n)
+                if y_eff > bot_:
+                    continue
+                top = y_eff; side_ = True
         d = fy - top                       # 平台在脚上方多少（负=在下面）
         if vy_up > 0:
             if vy_up*vy_up < 2*g*(d + 8*s):    # 跳不到这个高度（脚要高出平台顶一点才落得上去）
@@ -579,7 +801,7 @@ def _choose(player, vy_up, plats, enemies, col, s, prev_target, stuck, eventual,
             x0m, x1m = x0 + (np0 - pp0), x1 + (np0 - pp0)
         else:
             x0m, x1m = x0, x1
-        narrow_k = ("~" in kind) or kind[0] == "p" or kind == "j"
+        narrow_k = ("~" in kind) or kind[0] == "p" or kind == "j" or "x" in kind
         # 贴着左右边界的平台：落点离边界留出余量（站在边界上会来回穿框）
         x0e = max(x0m, col[0] + 14*s) if x0m < col[0] + 14*s < x1m else x0m
         x1e = min(x1m, col[1] - 14*s) if x0m < col[1] - 14*s < x1m else x1m
@@ -600,51 +822,66 @@ def _choose(player, vy_up, plats, enemies, col, s, prev_target, stuck, eventual,
         bad = any(x0 - 20*s < e[0] < x1 + 20*s and top - 90*s < e[1] < top + 5*s for e in enemies)
         severe = bad                       # 敌人就站在这块平台上：比别的危险选项更糟
         # 从这块平台弹起来会直接撞上它头顶的敌人（敌人在一跳高度以内、横向又重叠）：危险
-        if not bad and kind != "j":
-            jump_h = (cfg["jump_v"] * s * ts) ** 2 / (2 * g) + 80*s
+        if not bad and kind != "j" and "x" not in kind:
+            jump_h = 900*s if "*" in kind else (cfg["jump_v"] * s * ts) ** 2 / (2 * g) + 80*s
             for e in enemies:
-                if (e[0] + e[2]/2 > x0 - 6*s) and (e[0] - e[2]/2 < x1 + 6*s) and top - jump_h < e[1] + e[3]/2 < top + 5*s:
-                    bad = True; break
-        # 落到目标的路上会先经过别的带刺平台：横向路线跨过刺的位置就不行
-        if not bad:
-            v0_ = PHYS["vx"]; Vm_ = PHYS["vmax"] or 470*s; tau_ = cfg.get("htau", 0.167)
-            for sx0, sx1, stop in SPIKES:
-                if fy - 5*s < stop < top - 3*s:
-                    # 下落经过这个刺/危险平台的高度时人在哪：按一阶模型朝目标按住（离得很近就滑行），考虑穿框
-                    ds_ = fy - stop
-                    disc = vy_up*vy_up - 2*g*ds_
-                    if disc < 0:
+                if top - jump_h < e[1] + e[3]/2 < top + 5*s:
+                    if pillar_side(kind):
+                        zh = cut_hz(e, top, kind, s, 35*s)      # 柱子窄，落点就是柱子中间：身体左右各 35px 能不能躲开
+                        if zh > 0 and abs(e[0] - (x0 + x1) / 2) < zh:
+                            bad = True; break
                         continue
-                    tc = (vy_up + np.sqrt(disc)) / g
-                    u_ = float(np.sign(dx)) if abs(dx) > 30*s else 0.0
-                    disp = u_*Vm_*tc + (v0_ - u_*Vm_)*tau_*(1.0 - np.exp(-tc/tau_))
-                    if u_ != 0 and disp*u_ > abs(dx):
-                        disp = dx
-                    xc = col[0] + ((px + disp - col[0]) % Wd_)
-                    if sx0 - 26*s < xc < sx1 + 26*s:      # 脚的判定比盔甲中心宽（实测踩到平台边外 26px 也能弹起）
+                    zh = cut_hz(e, top, kind, s, 6*s)
+                    if zh > 0 and e[0] + zh > x0 and e[0] - zh < x1:
                         bad = True; break
-        # 去目标的横向路线（从现在高度到目标高度之间）上有敌人挡着：不去
-        if not bad and kind != "j":
-            tx = px + dx
-            if col[0] <= tx <= col[1]:
-                lo_, hi_ = min(px, tx) - 20*s, max(px, tx) + 20*s
-                apex_y = fy - max(vy_up, 0.0) ** 2 / (2 * g)          # 还在往上冲：路线会先经过最高点
-                ylo, yhi = min(apex_y - 50*s, fy - 60*s, top - 60*s), max(fy, top)
-                for e in enemies:
-                    if e[0] + e[2]/2 > lo_ and e[0] - e[2]/2 < hi_ and e[1] + e[3]/2 > ylo and e[1] - e[3]/2 < yhi:
-                        bad = True; break
-        # 落到这块平台的路上会擦过敌人的侧面（敌人比平台高、横向又挨着）也不去
-        if not bad and kind != "j":
-            for e in enemies:
-                etop_, ebot_ = e[1] - e[3]/2, e[1] + e[3]/2
-                # 按实际要落的那一段算（落点区间 ± 身体半宽 20px），不是整块平台
-                near = (a_r - 38*s < e[0] + e[2]/2) and (e[0] - e[2]/2 < b_r + 38*s)
-                if near and etop_ < top - 5*s and ebot_ > min(fy, top) - 40*s:
-                    bad = True; break
+        def _route_bad(dx_):
+            # 落到目标的路上会先经过别的带刺平台：脚在刺的高度范围里（平台顶往上 16px 是刺尖）时横向在刺上方就不行。
+            # 以前只看“落过平台顶那一刻”在哪，053644 最高点正好停在刺尖和平台顶之间、横着飘过刺 → 扎死
+            v0_ = PHYS["vx"]; Vm_ = PHYS["vmax"] or 470*s; tau_ = cfg.get("htau", 0.167)
+            apex_ = fy - (vy_up*vy_up / (2*g) if vy_up > 0 else 0.0)
+            rel_ = [q for q in SPIKES if q[2] < top - 3*s and q[2] + 2*s >= apex_ and q[2] - 16*s <= max(fy, top)]
+            if rel_:
+                u_ = float(np.sign(dx_)) if abs(dx_) > 30*s else 0.0
+                y_prev = fy; x_prev = px
+                n_ = int(max(t, 0.0) / 0.03) + 1
+                for k_ in range(1, n_ + 1):
+                    tt_ = min(k_ * 0.03, t)
+                    disp = u_*Vm_*tt_ + (v0_ - u_*Vm_)*tau_*(1.0 - np.exp(-tt_/tau_))
+                    if u_ != 0 and disp*u_ > abs(dx_):
+                        disp = dx_
+                    x_ = px + disp
+                    y_ = fy - (vy_up*tt_ - 0.5*g*tt_*tt_)
+                    lo_y, hi_y = min(y_prev, y_), max(y_prev, y_)
+                    for sx0, sx1, stop in rel_:
+                        if hi_y >= stop - 16*s and lo_y <= stop + 2*s:
+                            for xx_ in (x_prev, x_):
+                                xc = col[0] + ((xx_ - col[0]) % Wd_)
+                                if sx0 - 24*s < xc < sx1 + 24*s:      # 脚的判定比盔甲中心宽（实测踩到平台边外 26px 也能弹起）
+                                    return True
+                    y_prev, x_prev = y_, x_
+            # 按实际轨迹模拟（竖直抛物线 + 横向一阶模型朝目标按住）：身体（脚底往上 75px、左右 ±33px）路上会不会碰到敌人。
+            # 以前是“这段高度范围内横向挡着就不去”，太粗：很多时候先低空横移过去、再升高就能绕开（04:51 卡死就是这样）
+            if kind != "j" and traj_hits_enemy(px, fy, vy_up, PHYS["vx"], dx_, t, enemies, col, s, g,
+                                               hw=(min(33*s, desp_pad(s)) if "x" in kind else None)):
+                return True
+            return False
+        if not bad and _route_bad(dx):
+            bad = True
+            # 近路被敌人/尖刺挡住：试试反方向穿框绕过去（路远一点，但常常能避开）
+            if kind != "j" and not j_below and abs(dx) > 1*s:
+                dx_alt = ((a_r - px) % Wd_) if dx < 0 else -((px - b_r) % Wd_)
+                vm_a = (PHYS["vmax"] or 470*s) * min(1.0, cfg.get("reach_vfrac", 0.9) + (0.07 if stuck else 0.0))
+                if abs(dx_alt) < Wd_ - 20*s and time_to_cover(dx_alt, PHYS["vx"], cfg.get("htau", 0.167), vm_a) <= t - 0.06 \
+                        and not _route_bad(dx_alt):
+                    bad = False
+                    dx = dx_alt
+                    c_alt = dx_alt + hw_r if dx_alt > 0 else dx_alt - hw_r
+                    ra_, rb_ = c_alt - hw_r, c_alt + hw_r
         if "~" in kind and tilde_bad:
             bad = True                     # 带刺平台（只剩刺旁边一小段）：落点要求太准，没有干净平台时才去
+        ev_side = ev_from(x0, x1, top, s, col) if side_ else None
         if stuck:
-            if top > fy - 20*s and eventual.get((x0, x1, top, kind), top) > fy - 20*s:
+            if top > fy - 20*s and (ev_side if side_ else eventual.get((x0, x1, top, kind), top)) > fy - 20*s:
                 continue                   # 卡住时只考虑更高的、或能通往更高处的平台
             if "~" in kind and not severe:
                 bad = False                # 卡住时允许去带刺平台没刺的那一段
@@ -656,19 +893,20 @@ def _choose(player, vy_up, plats, enemies, col, s, prev_target, stuck, eventual,
         risk_ = max(0.0, 0.15 - slack_t) * 800*s if reach else 0.0   # 时间卡得太紧也算风险
         deficit = need - t                                     # 够不着时还差多少秒（越小越有希望）
         narrow = max(0.0, 45*s - (x1 - x0)) * 2.0            # 落脚区太窄扣分
-        ev_ = eventual.get((x0, x1, top, kind), top)       # 从这里出发最终能爬到的高度（全局规划）
+        ev_ = ev_side if side_ else eventual.get((x0, x1, top, kind), top)       # 从这里出发最终能爬到的高度（全局规划）
         sticky = prev_target is not None and abs(prev_target[2] - top) < 30*s and abs(prev_target[0] - x0) < 15*s
         # 同一块带刺平台的另一侧：不要在左右两段之间来回换（最容易换着换着踩到中间的刺）
         flip = prev_target is not None and not sticky and abs(prev_target[2] - top) < 10*s and \
             ("~" in kind or "~" in prev_target[3]) and abs(prev_target[0] - x0) < 160*s
         # 能稳稳到达的优先；越高越好，但横移越远扣分越多；当前目标加分，避免来回改主意
-        if vy_up <= 0:
-            # 正在往下落：够得着但有点危险的，强过够不着的（够不着基本就是摔死）
+        if vy_up <= 400*s:
+            # 正在往下落、或快到最高点了（这一跳的落点基本定了）：够得着但有点危险的，强过够不着的（够不着基本就是摔死）。
+            # 063257（50410 分）：快到最高点时附近的云被乌鸦的预测路线时好时坏地标成危险，换去追一块够不着的“干净”云，摔死
             cat = (0 if not bad else 1) if reach else (2 + (2 if bad else 0))
         else:
             cat = (0 if reach else 1) + (2 if bad else 0)
         key = (cat + (4 if severe else 0),     # 有危险的只在实在没得选时才去
-               ((ev_ + 0.5 * (top - ev_)) - ((150*s if vy_up > 0 else 30*s) if "*" in kind else 0) + ((120*s if tilde_bad else 30*s) if "~" in kind else 0) + (260*s if kind[0] == "b" and "~" in kind else 0) + narrow + (0.15 if stuck else 0.25)*abs(dx) + risk_ - (0 if stuck else ((120*s if "~" in kind else 60*s) if sticky else 0)) + (150*s if flip else 0)) if reach else deficit)
+               ((ev_ + 0.5 * (top - ev_)) - ((150*s if vy_up > 0 else 30*s) if "*" in kind else 0) + ((120*s if tilde_bad else 30*s) if "~" in kind else 0) + (260*s if kind[0] == "b" and "~" in kind else 0) + (80*s if "x" in kind else 0) + narrow + (0.15 if stuck else 0.25)*abs(dx) + risk_ - (0 if stuck else ((120*s if "~" in kind else 60*s) if sticky else 0)) + (150*s if flip else 0)) if reach else deficit)
         DBG.append((key[0], int(x0), int(x1), int(top), kind, int(dx), int(reach), int(bad)))
         CANDS.append({"plat": (x0, x1, top, kind), "kind": kind, "reach": bool(reach), "bad": bool(bad), "severe": bool(severe)})
         cand_ = (x0, x1, top, kind, dx, ev_, ra_, rb_, t)
@@ -725,6 +963,11 @@ class VTracker:
             self.last_scroll = 0.0            # 认不出滚屏量、角色又停在滚屏线上：这一帧不可信，跳过（滚屏量下一帧一起算）
             return self.value()
         scroll = float(np.median(ds)) if ds else 0.0
+        # 相机只在角色脚到了滚屏线（画面 60% 高处）还往上时才往上滚；角色在线下面时画面不可能滚。
+        # 以前平台识别差 1~2px 的抖动只累加正的一半，原地弹时累计滚屏会慢慢“爬升”，把卡住计时一直清零（05:52 卡在气球下面那局）
+        sy_ = SCREEN.get("sy")
+        if sy_ is not None and 0.0 < scroll < 4*s and player[1] > sy_ + 12*s and fy0 > sy_ + 12*s:
+            scroll = 0.0          # 只压掉小抖动；以前不分大小全压，滚屏线估计一跑偏就再也不累计滚屏（062101：后半局一直以为“卡住”）
         self.total_scroll += max(scroll, 0.0)
         self.last_scroll = scroll
         same = scroll == 0.0 and abs(player[1] - fy0) < 0.5
@@ -732,6 +975,15 @@ class VTracker:
             vy = (scroll - (player[1] - fy0)) / dt
             h = self.total_scroll - player[1]
             # 弹起：之前在下落（中间可能夹一帧刚好接触平台、速度≈0），现在明显在往上冲
+            if self.hist and min(self.hist[-2:]) < -40*s and vy > 300*s and (self.t_bounce is None or t0 - self.t_bounce > 0.25) \
+                    and getattr(self, "glitch_n", 0) < 2 and self._bounce_glitch(player, fy0 + max(scroll, 0.0), plats, s):
+                # 像弹起但脚下没平台：这一帧当作识别抖动整个跳过（滚屏量也退回去，下一帧和上一帧一起算）。
+                # 最多连着跳过 2 帧（万一真是踩到了没识别出来的东西，别一直不认）
+                self.glitch_n = getattr(self, "glitch_n", 0) + 1
+                self.total_scroll -= max(scroll, 0.0)
+                self.last_scroll = 0.0
+                return self.value()
+            self.glitch_n = 0
             if self.hist and min(self.hist[-2:]) < -40*s and vy > 300*s and (self.t_bounce is None or t0 - self.t_bounce > 0.25):
                 self.t_bounce = t0
                 # 起跳平台高度 = 弹起前后最低的那一帧（中间可能夹着接触帧）；存成（屏幕y, 当时的累计滚屏）
@@ -742,6 +994,22 @@ class VTracker:
             self.hist.append(vy); self.hist = self.hist[-3:]
             self.prev = (t, player[1], plats)
         return self.value()
+    def _bounce_glitch(self, player, y_prev, plats, s):
+        """看起来像弹起，但脚下附近根本没有平台：多半是识别抖动（穿框时角色被边框切掉一半，脚的 y 突然跳了），不算弹起。
+        054615（82020 分）：穿框那一帧 y 往上跳了 10px，被当成弹起，换了个高处目标往反方向按，错过脚下的平台摔死"""
+        col = getattr(self, "col", None)
+        y_low = max(player[1], y_prev)
+        for q in plats:
+            if q[3][0] == "p":
+                if not (q[2] - 45*s < y_low < q[2] + (PILLAR_H + 10) * s):
+                    continue                  # 柱子侧面也能弹起
+            elif abs(q[2] - y_low) > 45*s:
+                continue
+            c_ = (q[0] + q[1]) / 2.0
+            d_ = (c_ - player[0]) if col is None else wrap_dx(player[0], c_, col)
+            if abs(d_) < (q[1] - q[0]) / 2.0 + 45*s:
+                return False
+        return True
     def fit(self):
         """已知重力的抛物线拟合：h(τ) = h0 + v·τ - g/2·τ²（τ=相对最新一帧的时间），返回 (v, 残差)"""
         sm = self.samp
@@ -892,6 +1160,7 @@ def main():
     K = {"left": cfg.get("key_left", "a"), "right": cfg.get("key_right", "d"), "up": cfg.get("key_shoot", "w")}
     held = {"left": False, "right": False}
     held_since = {"left": None, "right": None}
+    key_refresh = [0.0]   # 定期把按键状态重发一遍：游戏偶尔会漏掉一次松键，导致某个方向键“卡住”（045835：没按键却一直往左漂，按右键 3 秒不动）
     def hold(k, on):
         if held[k] != on:
             (key_down if on else key_up)(K[k]); held[k] = on
@@ -909,7 +1178,7 @@ def main():
     def live_flush(now, tele):
         try:
             with open(os.path.join(LIVE, "telemetry.csv"), "w", encoding="utf-8") as tf:
-                tf.write("t,px,py,vy,vx,tx0,tx1,ttop,tkind,tdx,teve,keyL,keyR,mode,nplat,nen,stuck,scroll,cands\n")
+                tf.write("t,px,py,vy,vx,tx0,tx1,ttop,tkind,tdx,teve,keyL,keyR,mode,nplat,nen,stuck,scroll,cands,en,shot\n")
                 for r in tele:
                     tf.write(",".join(str(v) for v in r) + "\n")
             # 删掉 70 秒前的抽样画面
@@ -959,6 +1228,13 @@ def main():
                 pls_s = "|".join(f"{int(q[0])}-{int(q[1])}@{int(q[2])}{q[3]}" for q in pls)
                 lf.write(f"{bt:.3f},{pl[0]:.0f},{pl[1]:.0f},{vy_:.0f},{tgs},{ac_},{len(pls)},{';'.join(f'{e[0]:.0f}/{e[1]:.0f}/{e[4] if len(e) > 4 else chr(63)}' for e in ens)},"
                          f"{tg_[3] if tg_ else ''},{extra[1]},{pls_s},{extra[2]}\n")
+        try:   # 整局最近约 80 秒的逐帧遥测也存一份（死亡前 8 秒的录像不够看清“怎么走到这一步的”）
+            with open(os.path.join(d, "telemetry.csv"), "w", encoding="utf-8") as tf_:
+                tf_.write("t,px,py,vy,vx,tx0,tx1,ttop,tkind,tdx,teve,keyL,keyR,mode,nplat,nen,stuck,scroll,cands,en,shot\n")
+                for r_ in tele:
+                    tf_.write(",".join(str(v) for v in r_) + "\n")
+        except Exception:
+            pass
         log(f"已保存最近 {len(buf)} 帧到 {d}"); buf.clear()
     lp_ = os.path.join(HERE, "bot_log.txt")
     try:
@@ -972,6 +1248,9 @@ def main():
     def log(msg):
         print(msg); logf.write(time.strftime("%H:%M:%S ") + msg + "\n"); logf.flush()
     prev_target = None
+    last_tb = [None]
+    shot_cap = [0.0]
+    shoot_tgt = [None]              # 清障模式要打的敌人 (x, 时间)：对准了就开枪（不管平时的射击规则）                # 射击后 0.7 秒内每帧都存（半分辨率），用来看飞刀能不能打掉敌人
     last_shot = 0.0
     fps_t, fps_n = time.time(), 0
     with (mss.MSS() if hasattr(mss, "MSS") else mss.mss()) as sct:
@@ -1052,7 +1331,7 @@ def main():
                 small = cv2.resize(img, None, fx=0.5, fy=0.5)
                 cands_s = "|".join(f"{c[0]}:{c[1]}-{c[2]}@{c[3]}{c[4]}:dx{c[5]}:r{c[6]}b{c[7]}" for c in sorted(DBG)[:6])
                 buf.append((t, small, player, list(plats), list(enemies), vy_last[0], tgt_last[0], act_last[0], ("", int(PHYS["vx"]), cands_s)))
-                if len(buf) > 240: buf.pop(0)
+                if len(buf) > 360: buf.pop(0)
                 seen_t = t
             elif buf and seen_t and t - seen_t > 0.8 and len(buf) < 30:
                 buf.clear(); seen_t = 0            # 只活了不到 2 秒（开局过场等），不算一局
@@ -1091,9 +1370,22 @@ def main():
                     except Exception: pass
                 release_all(); vt.reset(); prog[0], prog[1] = 0.0, time.time(); time.sleep(0.01); continue
 
+            vt.col = col
             vy_up = vt.update(t, player, plats, s)
             sp_ = getattr(vt, "support", None)
             SUPPORT[0] = None if sp_ is None else sp_[0] + (getattr(vt, "total_scroll", 0.0) - sp_[1])
+            SCREEN["h"] = img.shape[0]
+            PHYS["vmax"] = cfg.get("vmax", 485) * s       # 实测按住 0.5 秒以上的稳定横向速度 ≈ 490（050621 四段 448~491）
+            if SCREEN["sy"] is None:
+                SCREEN["sy"] = 0.603 * img.shape[0]
+            if getattr(vt, "last_scroll", 0.0) > 3*s and vy_up > 100*s and abs(player[1] - SCREEN["sy"]) < 30*s:
+                # 只用靠近滚屏线的样本（识别跳到 y=194 这种异常值会把估计拉偏：062101）
+                SCREEN["sy"] = min(0.65 * img.shape[0], max(0.55 * img.shape[0], 0.95 * SCREEN["sy"] + 0.05 * player[1]))
+            if getattr(vt, "t_bounce", None) != last_tb[0]:
+                last_tb[0] = getattr(vt, "t_bounce", None)
+                # 新的一跳：如果落到的不是原来瞄的那块（意外踩到别的平台），旧目标作废，别再“认准”它（050621 就是认准了一块越来越低、最后滚出画面的柱子）
+                if prev_target is not None and SUPPORT[0] is not None and abs(prev_target[2] - SUPPORT[0]) > 30*s:
+                    prev_target = None
             # 移动平台（蓝色、云）测速：和上一帧配对
             sc1 = getattr(vt, "last_scroll", 0.0)
             newv = {}
@@ -1114,15 +1406,21 @@ def main():
             # 移动平台上的刺：估计速度，把它 0.5 秒内会扫过的范围都当成危险区
             sc0 = getattr(vt, "last_scroll", 0.0)
             ext = []
+            SPIKE_MOT.clear()
             for sx0, sx1, stop in SPIKES:
                 vx_ = 0.0
+                if (sx0, sx1, stop) in CUT_Z:
+                    # 敌人正下方的危险区：位置由敌人决定，不随移动平台外扩（051752：蓝平台被切掉的那段按平台速度外扩到角色脚下，
+                    # “躲刺”把角色推离目标、穿框摔死）
+                    ext.append((sx0, sx1, stop)); continue
                 if spk_prev[0] is not None and t - spk_prev[1] < 0.3:
                     c_ = [q for q in spk_prev[0] if abs(q[2] + sc0 - stop) < 6*s and abs((q[1]-q[0]) - (sx1-sx0)) < 8*s and abs(q[0] - sx0) < 60*s]
                     if c_:
                         q = min(c_, key=lambda q: abs(q[0] - sx0))
                         vx_ = (sx0 - q[0]) / max(t - spk_prev[1], 1e-3)
                 if abs(vx_) > 30*s:
-                    ext.append((min(sx0, sx0 + vx_*0.5) - 6*s, max(sx1, sx1 + vx_*0.5) + 6*s, stop))
+                    ee_ = (min(sx0, sx0 + vx_*0.5) - 6*s, max(sx1, sx1 + vx_*0.5) + 6*s, stop)
+                    ext.append(ee_); SPIKE_MOT[ee_] = (sx0, sx1, vx_)
                 else:
                     ext.append((sx0, sx1, stop))
             spk_prev[0], spk_prev[1] = list(SPIKES), t
@@ -1134,6 +1432,8 @@ def main():
                 ntop = mtop + sc_
                 if t - mt > (1.0 if mk[0] == "p" else 0.6) or mk[0] not in "gp":
                     continue
+                if ntop > img.shape[0] - 4*s:
+                    continue                   # 已经滚出画面底边了
                 if any(abs(q[2] - ntop) < 8*s and q[0] < mx1 and q[1] > mx0 for q in plats):
                     continue
                 # 柱子：画面里时有时无（被角色挡住、颜色闪烁），1 秒内都用记忆补回来
@@ -1166,7 +1466,7 @@ def main():
                                 PHYS["a"] = a_obs if PHYS["a"] is None else 0.85*PHYS["a"] + 0.15*a_obs
                         if hold_t > 0.45 and v_ * dirn > 0:
                             vm_obs = max(350*s, min(600*s, abs(v_)))
-                            PHYS["vmax"] = vm_obs if PHYS["vmax"] is None else 0.9*PHYS["vmax"] + 0.1*vm_obs
+                            pass   # 最大速度不在线估计了：被打中失控/顶着东西时测到的是垃圾值（051208 掉到 350，到处判断够不着）
             pvx[1] = (t, player[0])
             PHYS["vx"] = pvx[0]
             dirn_ = 1 if held["right"] and not held["left"] else (-1 if held["left"] and not held["right"] else 0)
@@ -1177,115 +1477,74 @@ def main():
 
             # 敌人速度预测（小丑会跟着移动平台走、乌鸦会飞）：用 0.3 秒后的位置一起判断
             moving = []; moving_long = []
-            if prev_en[0] is not None and t - prev_en[1] < 0.3:
-                for e in enemies:
-                    cands = [q for q in prev_en[0] if q[4] == e[4] and abs(q[0] - e[0]) < 80*s and abs(q[1] - e[1]) < 80*s]
-                    if cands:
-                        q = min(cands, key=lambda q: abs(q[0] - e[0]) + abs(q[1] - e[1]))
-                        vx = max(-600*s, min(600*s, (e[0] - q[0]) / max(t - prev_en[1], 1e-3)))
+            # 每个敌人一条轨迹，最近 0.3 秒的位置做线性拟合求横向速度（乌鸦扇翅膀时识别框中心会抖，单帧差分的速度噪声有几百 px/s，
+            # 用它预测会把乌鸦“预测”到角色另一边，躲避方向来回翻——203238 就是这么撞上的）
+            tracks = prev_en[0] if isinstance(prev_en[0], list) and (not prev_en[0] or isinstance(prev_en[0][0], dict)) else []
+            tracks = [tr for tr in tracks if t - tr["h"][-1][0] < 0.3]
+            TS_ = getattr(vt, "total_scroll", 0.0)          # 世界坐标 y = 屏幕 y - 累计滚屏（相机上移时屏幕上的东西整体下移）
+            used_tr = set()
+            en_vel = []                                      # [(cx, cy_world, w, h, kind, vx, vy_world)]
+            for e in enemies:
+                ew_y = e[1] - TS_
+                best_tr, best_d = None, 80*s
+                for i_tr, tr in enumerate(tracks):
+                    if i_tr in used_tr or tr["k"] != e[4]:
+                        continue
+                    lt, lx_, ly_ = tr["h"][-1]
+                    d_ = abs(wrap_dx(lx_, e[0], col)) + abs(ly_ - ew_y)
+                    if d_ < best_d:
+                        best_tr, best_d = i_tr, d_
+                vx = vyw = 0.0
+                if best_tr is None:
+                    tracks.append({"k": e[4], "h": [(t, e[0], ew_y)]}); used_tr.add(len(tracks) - 1)
+                else:
+                    used_tr.add(best_tr)
+                    tr = tracks[best_tr]
+                    lx_ = tr["h"][-1][1]
+                    tr["h"].append((t, lx_ + wrap_dx(lx_, e[0], col), ew_y))     # 横向坐标展开（穿框不跳变）
+                    tr["h"] = [q for q in tr["h"] if t - q[0] <= 0.3]
+                    if len(tr["h"]) >= 4:
+                        tt_ = np.array([q[0] for q in tr["h"]]) - t
+                        vx = float(np.polyfit(tt_, np.array([q[1] for q in tr["h"]]), 1)[0])
+                        vyw = float(np.polyfit(tt_, np.array([q[2] for q in tr["h"]]), 1)[0])
+                        vx = max(-600*s, min(600*s, vx)); vyw = max(-600*s, min(600*s, vyw))
                         if abs(vx) > 40*s:
                             moving.append((e[0] + vx*0.3, e[1], e[2] + abs(vx)*0.15, e[3], e[4]))
                             # 选目标用更长的预测：0.8 秒内它会扫过的整段范围
                             moving_long.append((e[0] + vx*0.4, e[1], e[2] + abs(vx)*0.8, e[3] + 20*s, e[4]))
-            prev_en[0], prev_en[1] = list(enemies), t
+                en_vel.append((e[0], ew_y, e[2], e[3], e[4], vx, vyw))
+            prev_en[0], prev_en[1] = tracks, t
             ts_now = getattr(vt, "total_scroll", 0.0)
             if ts_now - prog[0] > 40*s:
                 prog[0], prog[1] = ts_now, t
             stuck = t - prog[1] > 3.0
             STUCK_SOFT[0] = t - prog[1] > 2.0
+            dsp_ = t - prog[1] > 8.0
+            if dsp_ and not DESPERATE[0]:
+                log("[!] 8 秒没往上爬：冒险模式（允许贴着敌人、敌人下方能躲开的落点）")
+            DESPERATE[0] = (t - prog[1]) if dsp_ else 0.0
             if stuck and not prog[2]:
                 log("[!] 3 秒没往上爬，进入脱困模式"); prog[2] = True
             if not stuck: prog[2] = False
             if prev_target is not None:      # 相机滚动后，上一帧目标的 y 要跟着平移才能对上
                 prev_target = (prev_target[0], prev_target[1], prev_target[2] + getattr(vt, "last_scroll", 0.0)) + tuple(prev_target[3:])
-            tgt = choose(player, vy_up, plats, enemies + moving_long, col, s, None if stuck else prev_target, stuck)
+            # 气球从下面/侧面撞上会被往下弹开（061202：上升时擦到紫气球，一下被打到 -1000px/s 往下掉摔死），所以和别的敌人一样要躲
+            lethal_ = enemies + moving_long
+            tgt = choose(player, vy_up, plats, lethal_, col, s, None if stuck else prev_target, stuck)
             if stuck and tgt is None:
-                # 脱困时第一轮(stuck=True)已过滤掉自身/更低平台, 若无更高可达则保持 None
-                # 进入"寻"模式(向最近平台靠), 不再回退到 stuck=False 重选回原地
-                # (041603: 回退会选回 298-350@829 原地空跳 7.6 秒直至偏出踩空)
-                tgt = None
-            # 躲避：不能从下面/侧面碰到敌人；从上往下踩没事
-            g_px = cfg["gravity"] * s * cfg.get("timescale", 1.0) ** 2
-            ptop, pbot = player[1] - 68*s, player[1]          # 整个身体：脚底往上约 68px
-            threat = None
-            ethreat = None # 敌人威胁（带符号的横向距离），单独记以便做方向迟滞
-            for ex, ey, ew, eh, et in enemies + moving:
-                edx = wrap_dx(player[0], ex, col)
-                if abs(edx) > ew/2 + 45*s:
-                    continue
-                etop, ebot = ey - eh/2, ey + eh/2
-                if et != "xbox" and vy_up <= 0 and pbot <= etop + 12*s:
-                    continue                                  # 正在往下落、脚在它上面：可以踩
-                side = pbot > etop + 12*s and ptop < ebot + 10*s
-                rise = vy_up > 0 and ebot <= ptop and (ptop - ebot) < min(vy_up*vy_up/(2*g_px), 320*s) + 25*s
-                if rise and not side and cfg["shoot"] and et in ("clown", "jester", "crow") and (ptop - ebot) > 90*s \
-                        and abs(edx) < ew/2 + 15*s:
-                    # 正上方、还有一段距离：不躲，直接扔飞刀把它打掉
-                    if t - last_shot > 0.2:
-                        key_tap_async(K["up"], t); last_shot = t
-                    continue
-                if side or rise:
-                    if threat is None or abs(edx) < abs(threat): threat = edx
-                    if ethreat is None or abs(edx) < abs(ethreat): ethreat = edx
-            # 正在往下落，脚下不远处就是刺：往离刺远的一边躲
-            if threat is None and vy_up <= 0:
-                g_e = cfg["gravity"] * s * cfg.get("timescale", 1.0) ** 2
-                tau_e = cfg.get("htau", 0.167)
-                for sx0, sx1, stop in SPIKES:
-                    d_e = stop - player[1]
-                    if 0 <= d_e < 130*s:
-                        # 按现在的速度滑过去，落到这个高度时会在哪；脚的判定半宽约 26px
-                        t_e = (vy_up + np.sqrt(vy_up*vy_up + 2*g_e*d_e)) / g_e
-                        xp_e = player[0] + PHYS["vx"] * tau_e * (1.0 - np.exp(-t_e / tau_e))
-                        lo_e, hi_e = sx0 - 26*s, sx1 + 26*s
-                        if lo_e < xp_e < hi_e:
-                            threat = 1.0 if (xp_e - lo_e) < (hi_e - xp_e) else -1.0   # threat>=0 往左躲：离左边出口近就往左
-                            break
+                # 脱困时没有更高的可达平台：先稳稳地原地弹（精确控制落点），别进“寻”模式漂出平台摔死（042421）
+                tgt = choose(player, vy_up, plats, lethal_, col, s, None, False)
+            # ---- 先算控制器本来想怎么按：u_ctl = +1 右 / -1 左 / 0 松手 ----
             mode = ""
-            if ethreat is not None:
-                # 敌人躲避方向迟滞：已在躲且威胁没明显换边时，保持原方向
-                # （乌鸦贴脸时识别抖动会让 edx 符号来回翻，不加迟滞就原地抖、被追上）
-                dodge_want = 1 if ethreat >= 0 else -1
-                if DODGE_DIR[0] != 0 and dodge_want != DODGE_DIR[0] and abs(ethreat) < 45*s:
-                    dodge_want = DODGE_DIR[0]
-                DODGE_DIR[0] = dodge_want
-                threat = float(dodge_want)  # 沿用下面 threat>=0 往左躲的约定
-            else:
-                DODGE_DIR[0] = 0
-            if threat is not None:
-                mode = "躲"
-                if threat >= 0: hold("right", False); hold("left", True)
-                else: hold("left", False); hold("right", True)
-            elif stuck and PILLARS:
-                # 脱困：主动去蹭最近弹簧柱的侧面（碰到就往上弹），打破原地弹跳死循环。
-                # 躲避（threat）分支在前，优先级不变；弹起开始爬升后 stuck 自动解除。
-                _pl0, _pl1 = min(PILLARS, key=lambda p: abs(wrap_dx(player[0], (p[0] + p[1]) / 2, col)))[:2]
-                _pdx = wrap_dx(player[0], (_pl0 + _pl1) / 2, col)
-                mode = "柱"
-                if _pdx > 30 * s:
-                    hold("left", False); hold("right", True)
-                elif _pdx < -30 * s:
-                    hold("right", False); hold("left", True)
-                else:
-                    release_all()
-            elif tgt is None:
-                _fb = [p for p in plats if "!" not in p[3]] or plats
+            u_ctl = 0
+            if tgt is None:
+                _fb = [p for p in plats if "!" not in p[3] and land_ok(p[2], 0.0, s)] or [p for p in plats if "!" not in p[3]] or plats
                 if _fb:
-                    # 无候选兜底：一般是掉到所有平台下方（下落时脚上方平台全被过滤）。
-                    # release_all 等于松手等死；改为朝最近平台的横向位置靠拢——
-                    # 万一中途弹起（复跳/弹簧），横向已对准才有机会落回去。
-                    # 躲避（threat）分支在前，这里只处理无威胁 + 无目标的情况。
+                    # 无候选兜底（一般是掉到所有平台下方）：朝最近平台的横向位置靠拢
                     _fx0, _fx1 = min(_fb, key=lambda p: abs(wrap_dx(player[0], (p[0] + p[1]) / 2, col)))[:2]
                     _fdx = wrap_dx(player[0], (_fx0 + _fx1) / 2, col)
                     mode = "寻"
-                    if _fdx > 30 * s:
-                        hold("left", False); hold("right", True)
-                    elif _fdx < -30 * s:
-                        hold("right", False); hold("left", True)
-                    else:
-                        release_all()
-                else:
-                    release_all()
+                    u_ctl = 1 if _fdx > 30*s else (-1 if _fdx < -30*s else 0)
             else:
                 prev_target = tgt
                 # 横向是一阶系统：现在松手，落地那一刻会滑到哪？落在落脚区间里就松手，不够就按住，冲过头就反向
@@ -1299,13 +1558,91 @@ def main():
                 narrow_t = ("~" in tgt[3]) or tgt[3][0] == "p" or tgt[3] == "j"
                 c_ = (ra_ + rb_) / 2
                 hw_ = max((rb_ - ra_) / 2, (6*s) if narrow_t else cfg["deadzone"] * s)
-                if xc_ < c_ - hw_:
-                    hold("left", False); hold("right", True)
-                elif xc_ > c_ + hw_:
-                    hold("right", False); hold("left", True)
+                u_ctl = 1 if xc_ < c_ - hw_ else (-1 if xc_ > c_ + hw_ else 0)
+            # ---- 卡住时清障：往上的平台被它头顶的敌人“切掉”了（死胡同），敌人能打掉的话（气球能打破——用户确认）：
+            # 趁这一跳头够不着它，横移到它正下方让自动射击开枪，再回到目标落点 ----
+            if stuck and tgt is not None and len(tgt) >= 9 and vy_up > 80*s and t - last_shot > 0.35:
+                g_s = cfg["gravity"] * s * cfg.get("timescale", 1.0) ** 2
+                head_top = player[1] - vy_up * vy_up / (2 * g_s) - 75*s
+                sup_ = SUPPORT[0] if SUPPORT[0] is not None else player[1]
+                shootable = cfg.get("shoot_kinds", ["clown", "crow", "enemy"])   # 气球一律不打：它是跳板（用户要求；061818 打掉挡路的气球后反而上不去）
+                blk_ = []
+                for (cx0, cx1, ctop, ckind, cens) in CUT_SRC:
+                    if ctop > sup_ - 30*s:
+                        continue                                # 只管比现在高的平台
+                    for e in cens:
+                        if e[4] in shootable and e[1] + e[3]/2 < head_top - 12*s and player[1] - e[1] < 650*s:
+                            blk_.append(e)
+                if blk_:
+                    e = min(blk_, key=lambda e: abs(wrap_dx(player[0], e[0], col)))
+                    dxs = wrap_dx(player[0], e[0], col)
+                    t_ap = vy_up / g_s
+                    tau_s = cfg.get("htau", 0.167); vm_s = (PHYS["vmax"] or 470*s) * 0.9
+                    back = abs(wrap_dx(e[0], player[0] + (tgt[6] + tgt[7]) / 2, col))
+                    back_ok = time_to_cover(back, 0.0, tau_s, vm_s) <= max(0.0, tgt[8] - t_ap) - 0.12
+                    alt_ok = False
+                    if not back_ok and DESPERATE[0]:
+                        # 回不到原来的目标：打掉它之后落到被它挡住的那块平台上（打不掉就会摔——只在卡了 8 秒以上时赌）
+                        apex_f = player[1] - vy_up * vy_up / (2 * g_s)
+                        for (cx0, cx1, ctop, ckind, cens) in CUT_SRC:
+                            if any(abs(q[0] - e[0]) < 2*s and abs(q[1] - e[1]) < 2*s for q in cens) and ctop > apex_f + 20*s:
+                                d_alt = abs(span_dx(e[0], cx0, cx1, col, min(8*s, (cx1 - cx0) * 0.3)))
+                                if time_to_cover(d_alt, 0.0, tau_s, vm_s) <= np.sqrt(2 * (ctop - apex_f) / g_s) - 0.1:
+                                    alt_ok = True; break
+                    if time_to_cover(dxs, PHYS["vx"], tau_s, vm_s) <= t_ap + 0.1 and (back_ok or alt_ok):
+                        u_ctl = 1 if dxs > 8*s else (-1 if dxs < -8*s else 0); mode = "射"
+                        shoot_tgt[0] = (e[0], t)
+            # ---- 躲避：按轨迹预测会不会撞上敌人（敌人按拟合出的速度直线移动；角色竖直抛物线 + 横向一阶模型）。
+            # 只有本来的按法 0.6 秒内会撞上才躲；躲的方向挑“不会撞/最晚才撞”的那个，同样安全时保持原来的按法和上次的躲避方向 ----
+            g_px = cfg["gravity"] * s * cfg.get("timescale", 1.0) ** 2
+            fy_w = player[1] - getattr(vt, "total_scroll", 0.0)
+            if en_vel:
+                # 只看落到目标平台之前：落上去就弹起来了，之后的轨迹不是这条（052725：脚下就是目标平台，
+                # 却按“一直往下掉”算会撞到平台下面的乌鸦，躲开反而错过平台摔死）
+                tmax_d = 0.6
+                if tgt is not None and len(tgt) >= 9:
+                    tmax_d = max(0.1, min(0.6, tgt[8] + 0.03))
+                h0 = first_hit(player[0], fy_w, vy_up, PHYS["vx"], u_ctl, en_vel, col, s, g_px, tmax=tmax_d)
+                if h0 is not None:
+                    opts = []
+                    for u_ in dict.fromkeys((u_ctl, DODGE_DIR[0], -1, 1, 0)):
+                        h_ = h0 if u_ == u_ctl else first_hit(player[0], fy_w, vy_up, PHYS["vx"], u_, en_vel, col, s, g_px, tmax=tmax_d)
+                        opts.append((h_ is None, 9.0 if h_ is None else h_, -abs(u_ - u_ctl), u_ == DODGE_DIR[0], u_))
+                    best_ = max(opts)
+                    if best_[4] != u_ctl:
+                        u_ctl = best_[4]; mode = "躲"
+                    DODGE_DIR[0] = best_[4]
                 else:
-                    release_all()
+                    DODGE_DIR[0] = 0
+            # ---- 正在往下落，脚下不远处就是刺/危险区：往离它远的一边躲 ----
+            if mode != "躲" and vy_up <= 0:
+                tau_e = cfg.get("htau", 0.167)
+                for sx0, sx1, stop in SPIKES:
+                    d_e = stop - player[1]
+                    if -2*s <= d_e < 130*s:
+                        t_e = (vy_up + np.sqrt(vy_up*vy_up + 2*g_px*d_e)) / g_px
+                        xp_e = player[0] + PHYS["vx"] * tau_e * (1.0 - np.exp(-t_e / tau_e))
+                        lo_e, hi_e = sx0 - 26*s, sx1 + 26*s
+                        if (sx0, sx1, stop) in SPIKE_MOT:
+                            # 移动平台上的刺：按落到那个高度时刺移到哪算（不能用外扩过的整段：053040 把目标段也算进去了，
+                            # “躲刺”往反方向推，错过移动平台摔死）
+                            m0_, m1_, mv_ = SPIKE_MOT[(sx0, sx1, stop)]
+                            lo_e, hi_e = m0_ + mv_ * t_e - 26*s, m1_ + mv_ * t_e + 26*s
+                        if lo_e < xp_e < hi_e:
+                            u_ctl = -1 if (xp_e - lo_e) < (hi_e - xp_e) else 1   # 离左边出口近就往左
+                            mode = "躲"
+                            break
+            if u_ctl > 0:
+                hold("left", False); hold("right", True)
+            elif u_ctl < 0:
+                hold("right", False); hold("left", True)
+            else:
+                release_all()
 
+            if t - key_refresh[0] > 0.2:
+                key_refresh[0] = t
+                for k_ in ("left", "right"):
+                    (key_down if held[k_] else key_up)(K[k_])
             vy_last[0] = vy_up; tgt_last[0] = tgt
             act_last[0] = ("→" if held["right"] else ("←" if held["left"] else "·")) + mode
             tele.append((round(t, 3), round(player[0]), round(player[1]), round(vy_up), round(PHYS["vx"]),
@@ -1314,7 +1651,8 @@ def main():
                          "" if tgt is None or len(tgt) < 6 else round(tgt[5]),
                          int(held["left"]), int(held["right"]), mode or "", len(plats), len(enemies), int(stuck),
                          round(getattr(vt, "total_scroll", 0.0)),
-                         "|".join(f"{c[0]}:{c[1]}-{c[2]}@{c[3]}{c[4]}:dx{c[5]}:r{c[6]}b{c[7]}" for c in sorted(DBG)[:5])))
+                         "|".join(f"{c[0]}:{c[1]}-{c[2]}@{c[3]}{c[4]}:dx{c[5]}:r{c[6]}b{c[7]}" for c in sorted(DBG)[:5]),
+                         ";".join(f"{e[4]}/{e[0]:.0f}/{e[1]:.0f}" for e in enemies), int(t - last_shot < 0.25)))
             if len(tele) > 2400: del tele[:len(tele) - 2400]
             if t - tele_flush[1] > 0.5:
                 tele_flush[1] = t
@@ -1336,6 +1674,17 @@ def main():
                     pass
             if t - tele_flush[0] > 10:
                 tele_flush[0] = t; io_submit(lambda now_=t, tl_=list(tele): live_flush(now_, tl_))
+            if t < shot_cap[0]:
+                try:
+                    SHD = os.path.join(LIVE, "shots"); os.makedirs(SHD, exist_ok=True)
+                    def _dump_shot(im_=cv2.resize(img, None, fx=0.5, fy=0.5), p_=os.path.join(SHD, f"{t:.3f}.jpg"), SHD=SHD):
+                        cv2.imwrite(p_, im_, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        fl_ = sorted(os.listdir(SHD))
+                        for fn in fl_[:-400]:
+                            os.remove(os.path.join(SHD, fn))
+                    io_submit(_dump_shot)
+                except Exception:
+                    pass
             if t - raw_dump[0] > 3.0:             # 每 3 秒存一张原始全分辨率画面（无损），用来调识别
                 raw_dump[0] = t
                 try:
@@ -1354,9 +1703,13 @@ def main():
 
             # 头顶有敌人：射击
             if cfg["shoot"] and enemies and t - last_shot > 0.25:
+                st_ = shoot_tgt[0] if shoot_tgt[0] is not None and t - shoot_tgt[0][1] < 0.3 else None
                 for ex, ey, ew, eh, et in enemies + moving:          # 包括按速度预测的位置（提前量）
                     if et != "balloon" and ey + eh/2 < player[1] - 60*s and player[1] - ey < 680*s and abs(wrap_dx(player[0], ex, col)) < ew/2 + 15*s:
-                        key_tap_async(K["up"], t); last_shot = t; break
+                        key_tap_async(K["up"], t); last_shot = t; shot_cap[0] = t + 0.7
+                        if st_ is not None:
+                            log(f"[射] 清障开枪：{et} ({ex:.0f},{ey:.0f})")
+                        break
 
             fps_n += 1
             if t - fps_t > 5:

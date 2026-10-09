@@ -121,8 +121,21 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
     trace = []  # 每步一句话摘要：崩溃时存成 partial 报告，分析过程不丢
     call_counts = {}   # (工具名, 目标) -> 累计次数：目标指 path/key 参数；
     warned_sigs = set()  # 已经提醒过的签名，不重复提醒
+    did_edit = False    # 模型是否调过 edit_file/write_file（endgame enforcer 用）
+    did_report = False  # 模型是否成功调过 write_report
+    converge_step = max(1, max_steps - 5)  # 最后 5 步强制收敛
     try:
         for step in range(1, max_steps + 1):
+            if step == converge_step and report_key and not did_report:
+                messages.append({
+                    "role": "user",
+                    "content": ("[收敛提醒] 还剩 5 步，你必须收敛，不要再开新的调查分支。\n"
+                                "两条出路二选一：\n"
+                                "1) 改代码：用 edit_file 改 analysis/work.py，跑测试门"
+                                "（py_compile + test_harness，errors: 0），然后 write_report 写报告；\n"
+                                "2) 不改代码：用 write_report 写报告，结论明确写“无需改动”并说明原因。\n"
+                                "步数用完还没写报告，会被记为未收敛。")})
+                print("  [!] 已注入收敛提醒（还剩 5 步）")
             trim_history(messages, budget)
             print(f"\n--- 步骤 {step}（历史约 {count_chars(messages)} 字符）---")
             text, calls = mc.chat(messages, tools=schemas)
@@ -153,6 +166,11 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
                     preview = str(result)[:200].replace("\n", " ")
                 print(f"  返回（{ms}ms）：{preview}")
                 messages.extend(to_tool_messages(c["id"], result))
+                if c["name"] in ("edit_file", "write_file"):
+                    did_edit = True
+                elif (c["name"] == "write_report" and isinstance(result, str)
+                        and result.startswith("报告已保存")):
+                    did_report = True
                 # 循环熔断器：同一工具反复折腾同一目标，累计 4 次还没进展就是打转。
                 # 注意是按"目标"（path/key）算，不是按完全相同的参数——换 max_chars
                 # 反复读同一文件、换 tail_chars 反复看同一段，都算重复。
@@ -202,28 +220,33 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
         _pause_if_console()
         raise SystemExit(1)
 
-    # 兜底：如果模型忘了调 write_report，把最后的输出和步骤回放也存一份，不丢东西。
-    # 只有正式报告（<key>_report.md）已存在才跳过；抢救记录（_unsaved/_PARTIAL）
-    # 每次重写——否则重跑同一局死亡时，旧记录会挡住新记录。
+    # endgame enforcer：模型没调 write_report 就自动生成带明确结论的收敛记录。
+    # 只有模型真正写过报告（did_report）或正式报告已存在才跳过；
+    # 抢救记录（_unsaved/_PARTIAL）每次重写——否则重跑同一局死亡时旧记录挡住新记录。
     if report_key and (final_text or trace):
         reports = os.path.join(agent_dir, "reports")
         os.makedirs(reports, exist_ok=True)
         existing = set(os.listdir(reports))
-        if f"{report_key}_report.md" not in existing:
+        if not did_report and f"{report_key}_report.md" not in existing:
             for f in existing:
                 if f.startswith(report_key) and f.endswith(("_unsaved.md", "_PARTIAL.md")):
                     try:
                         os.remove(os.path.join(reports, f))
                     except OSError:
                         pass
+            verdict = "CHANGED_NO_REPORT" if did_edit else "NO_VERDICT"
             p = os.path.join(reports, f"{report_key}_report_unsaved.md")
             with open(p, "w", encoding="utf-8") as f:
-                f.write(f"# {report_key} —— 未正常结束时的抢救记录\n\n")
+                f.write(f"# {report_key} —— 自动收敛记录（模型未调用 write_report）\n\n")
+                f.write(f"VERDICT: {verdict}\n\n")
+                f.write("代码改动："
+                        + ("有（改了 analysis/work.py，但没写报告）\n\n" if did_edit
+                           else "无\n\n"))
                 if final_text:
                     f.write(f"## 模型最后的输出\n\n{final_text}\n\n")
                 if trace:
                     f.write("## 步骤回放（每步摘要）\n\n" + "\n".join(trace) + "\n")
-            print(f"模型没有调用 write_report，已把抢救记录存为 {p}")
+            print(f"模型没有调用 write_report，已把自动收敛记录存为 {p}（VERDICT={verdict}）")
 
     print("\n完成。报告在 agent/reports/ 目录下。")
     _pause_if_console()

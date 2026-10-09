@@ -8,7 +8,8 @@
 
 工作流：分析死因 → 改 analysis/work.py（自动备份）→ 过 py_compile →
 跑 test_harness（errors: 0）→ 写报告。
-不碰 blimp_bot.py：复制上线是人工确认步骤，看完报告后双击 run_promote.bat。
+不碰 blimp_bot.py：复制上线由外部自动 loop（loop.py）完成，
+测试门通过后自动 promote + 重启 bot。
 """
 import json
 import os
@@ -50,7 +51,8 @@ def main():
     run(cfg, EXECUTOR_SYSTEM_PROMPT,
         f"请接手这次死亡：deaths/{name}/（里面有 log.csv 和截图）。按你的工作流："
         f"先分析死因，再改 analysis/work.py，编译和回归测试通过后写报告。"
-        f"记住：不要复制成 blimp_bot.py，那一步由用户手动做。",
+        f"记住：不要复制成 blimp_bot.py——测试通过后外部自动 loop 会负责上线，"
+        f"你只管 work.py 和报告。",
         EXECUTOR_SCHEMAS, report_key=name)
 
 

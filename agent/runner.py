@@ -119,7 +119,7 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
 
     final_text = ""
     trace = []  # 每步一句话摘要：崩溃时存成 partial 报告，分析过程不丢
-    call_counts = {}   # (工具名, 参数JSON) -> 累计次数：抓"非连续"的重复调用
+    call_counts = {}   # (工具名, 目标) -> 累计次数：目标指 path/key 参数；
     warned_sigs = set()  # 已经提醒过的签名，不重复提醒
     try:
         for step in range(1, max_steps + 1):
@@ -153,19 +153,28 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
                     preview = str(result)[:200].replace("\n", " ")
                 print(f"  返回（{ms}ms）：{preview}")
                 messages.extend(to_tool_messages(c["id"], result))
-                # 循环熔断器：同一个工具+同样参数累计调 4 次还没进展，说明在打转
-                sig = (c["name"], json.dumps(c["arguments"], sort_keys=True,
-                                            ensure_ascii=False))
+                # 循环熔断器：同一工具反复折腾同一目标，累计 4 次还没进展就是打转。
+                # 注意是按"目标"（path/key）算，不是按完全相同的参数——换 max_chars
+                # 反复读同一文件、换 tail_chars 反复看同一段，都算重复。
+                args = c["arguments"] if isinstance(c["arguments"], dict) else {}
+                target = args.get("path") or args.get("key") or ""
+                if not target:
+                    target = json.dumps(args, sort_keys=True, ensure_ascii=False)
+                sig = (c["name"], target)
                 call_counts[sig] = call_counts.get(sig, 0) + 1
                 if call_counts[sig] == 4 and sig not in warned_sigs:
                     warned_sigs.add(sig)
-                    print("  ⚠ 重复调用 4 次，注入提醒")
+                    print("  [!] 同一目标反复调用 4 次，注入提醒")
+                    tshort = str(target)
+                    if len(tshort) > 80:
+                        tshort = tshort[:80] + "…"
                     messages.append({
                         "role": "user",
-                        "content": (f"⚠ 重复调用提醒：你已经用完全相同的参数调用了 {c['name']} 共 4 次，"
-                                    "返回的内容没有变化，你正在原地打转。立刻用 read_notes 查看笔记本里"
-                                    "已确认的事实，然后换思路推进（读代码找逻辑、看别的证据、收敛写报告）。"
-                                    "不要再重复这次调用。")})
+                        "content": (f"[重复调用提醒] 你已经对同一目标调用了 {c['name']} 共 4 次"
+                                    f"（{tshort}），返回的内容没有实质变化，你正在原地打转。"
+                                    "立刻用 read_notes 查看笔记本里已确认的事实，然后换思路推进"
+                                    "（用 search_code 按关键词定位代码、看别的证据、收敛写报告）。"
+                                    "不要再重复这类调用。")})
             trace.append(
                 "### 步骤 %d\n%s\n工具：%s\n" % (
                     step, (text or "")[:400],
@@ -193,12 +202,20 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
         _pause_if_console()
         raise SystemExit(1)
 
-    # 兜底：如果模型忘了调 write_report，把最后的输出和步骤回放也存一份，不丢东西
-    if report_key:
+    # 兜底：如果模型忘了调 write_report，把最后的输出和步骤回放也存一份，不丢东西。
+    # 只有正式报告（<key>_report.md）已存在才跳过；抢救记录（_unsaved/_PARTIAL）
+    # 每次重写——否则重跑同一局死亡时，旧记录会挡住新记录。
+    if report_key and (final_text or trace):
         reports = os.path.join(agent_dir, "reports")
-        existing = set(os.listdir(reports)) if os.path.isdir(reports) else set()
-        if not any(report_key in f for f in existing) and (final_text or trace):
-            os.makedirs(reports, exist_ok=True)
+        os.makedirs(reports, exist_ok=True)
+        existing = set(os.listdir(reports))
+        if f"{report_key}_report.md" not in existing:
+            for f in existing:
+                if f.startswith(report_key) and f.endswith(("_unsaved.md", "_PARTIAL.md")):
+                    try:
+                        os.remove(os.path.join(reports, f))
+                    except OSError:
+                        pass
             p = os.path.join(reports, f"{report_key}_report_unsaved.md")
             with open(p, "w", encoding="utf-8") as f:
                 f.write(f"# {report_key} —— 未正常结束时的抢救记录\n\n")

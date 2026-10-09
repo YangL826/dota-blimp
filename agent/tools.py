@@ -180,6 +180,44 @@ def do_read_notes():
     return text or "（笔记本是空的，还没记任何东西）"
 
 
+def do_search_code(pattern, path="analysis/work.py", context_lines=3, max_hits=40):
+    """在代码文件里按关键词/正则搜，返回匹配行的行号和上下文。
+    找函数、找逻辑时先搜再读——对几十 KB 的大文件 head/tail 盲读是烧步数的无用功。"""
+    p = _safe(path or "analysis/work.py", PROJECT_ROOT)
+    if not os.path.isfile(p):
+        return f"文件不存在：{path}"
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return "拒绝：pattern 为空"
+    if len(pattern) > 200:
+        return "拒绝：pattern 太长（>200 字），换更短的关键词"
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return f"正则写错了：{e}"
+    with open(p, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    hits = [i for i, ln in enumerate(lines) if rx.search(ln)]
+    if not hits:
+        return f"在 {path} 里没搜到：{pattern}"
+    context_lines = max(0, min(int(context_lines or 0), 10))
+    max_hits = max(1, min(int(max_hits or 40), 100))
+    spans = []
+    for i in hits[:max_hits]:
+        s, e = max(0, i - context_lines), min(len(lines), i + context_lines + 1)
+        if spans and s <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], e)
+        else:
+            spans.append([s, e])
+    out = [f"在 {path} 搜到 {len(hits)} 处："]
+    for s, e in spans:
+        out.append(f"--- 行 {s + 1}-{e} ---")
+        out.extend(f"{n + 1:>5}: {lines[n]}" for n in range(s, e))
+    if len(hits) > max_hits:
+        out.append(f"…还有 {len(hits) - max_hits} 处没展示，换更精确的关键词。")
+    return "\n".join(out)
+
+
 # ---------- 阶段 2 新增：受控的写与执行 ----------
 
 def do_write_file(path, content):
@@ -262,6 +300,7 @@ TOOL_FUNCS = {
     "write_report": do_write_report,
     "write_note": do_write_note,
     "read_notes": do_read_notes,
+    "search_code": do_search_code,
     "write_file": do_write_file,
     "edit_file": do_edit_file,
     "run_command": do_run_command,
@@ -300,6 +339,12 @@ TOOL_SCHEMAS = [
     _schema("read_notes", "读工作笔记本。每次读文件/图片/列目录之前先读它——已经记下来的东西不许再读一遍。",
             {},
             []),
+    _schema("search_code", "在代码文件里按关键词/正则搜，返回行号+上下文。找函数、找逻辑时先搜再读，不要对几十KB的大文件 head/tail 盲读。",
+            {"pattern": {"type": "string", "description": "关键词或正则，如 'def choose|DODGE|躲避'"},
+             "path": {"type": "string", "description": "相对项目根目录，默认 'analysis/work.py'"},
+             "context_lines": {"type": "integer", "description": "每处带几行上下文，默认 3"},
+             "max_hits": {"type": "integer", "description": "最多展示几处，默认 40"}},
+            ["pattern"]),
     _schema("write_report", "把最终报告（Markdown 中文）保存到 agent/reports/。任务完成前必须调用一次。",
             {"filename": {"type": "string", "description": "文件名，如 '203238_death_report.md'，必须 .md 结尾"},
              "content": {"type": "string", "description": "报告正文（Markdown，中文）"}},

@@ -695,7 +695,7 @@ def _choose(player, vy_up, plats, enemies, col, s, prev_target, stuck, eventual,
                 return c_
     # 认准目标：当前目标还够得着、也没变危险，就不换（除非新目标明显更好）；往下落时更不换
     if stick is not None and best is not None:
-        if stick_key[0] <= best_key[0] and (vy_up <= 0 or stick_key[1] <= best_key[1] + 100*s):
+        if stick_key[0] <= best_key[0] and (vy_up <= 0 or stick_key[1] <= best_key[1] + (400*s if DODGE_DIR[0] != 0 else 150*s)):
             return stick
     return best
 

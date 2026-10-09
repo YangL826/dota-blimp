@@ -108,6 +108,7 @@ def blobs(mask, min_area=20, half=False):
 SPIKE_MEM = []
 UPS = []
 STUCK_SOFT = [False]
+DODGE_DIR = [0] # 躲避方向迟滞：+1=往左躲，-1=往右躲，0=没在躲（防乌鸦贴脸时方向抖动）
 SUPPORT = [None]   # 上次起跳的平台顶（当前屏幕坐标）
 DBG = []          # 本帧所有候选落点（写进死亡记录，方便事后分析）
 PLAYER_LAST = [None]   # 上一帧角色位置（连续跟踪用）
@@ -1195,6 +1196,7 @@ def main():
             g_px = cfg["gravity"] * s * cfg.get("timescale", 1.0) ** 2
             ptop, pbot = player[1] - 68*s, player[1]          # 整个身体：脚底往上约 68px
             threat = None
+            ethreat = None # 敌人威胁（带符号的横向距离），单独记以便做方向迟滞
             for ex, ey, ew, eh, et in enemies + moving:
                 edx = wrap_dx(player[0], ex, col)
                 if abs(edx) > ew/2 + 45*s:
@@ -1212,6 +1214,7 @@ def main():
                     continue
                 if side or rise:
                     if threat is None or abs(edx) < abs(threat): threat = edx
+                    if ethreat is None or abs(edx) < abs(ethreat): ethreat = edx
             # 正在往下落，脚下不远处就是刺：往离刺远的一边躲
             if threat is None and vy_up <= 0:
                 g_e = cfg["gravity"] * s * cfg.get("timescale", 1.0) ** 2
@@ -1227,6 +1230,16 @@ def main():
                             threat = 1.0 if (xp_e - lo_e) < (hi_e - xp_e) else -1.0   # threat>=0 往左躲：离左边出口近就往左
                             break
             mode = ""
+            if ethreat is not None:
+                # 敌人躲避方向迟滞：已在躲且威胁没明显换边时，保持原方向
+                # （乌鸦贴脸时识别抖动会让 edx 符号来回翻，不加迟滞就原地抖、被追上）
+                dodge_want = 1 if ethreat >= 0 else -1
+                if DODGE_DIR[0] != 0 and dodge_want != DODGE_DIR[0] and abs(ethreat) < 45*s:
+                    dodge_want = DODGE_DIR[0]
+                DODGE_DIR[0] = dodge_want
+                threat = float(dodge_want)  # 沿用下面 threat>=0 往左躲的约定
+            else:
+                DODGE_DIR[0] = 0
             if threat is not None:
                 mode = "躲"
                 if threat >= 0: hold("right", False); hold("left", True)

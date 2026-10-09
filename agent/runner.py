@@ -107,6 +107,7 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
     ]
 
     final_text = ""
+    trace = []  # 每步一句话摘要：崩溃时存成 partial 报告，分析过程不丢
     try:
         for step in range(1, max_steps + 1):
             trim_history(messages, budget)
@@ -139,10 +140,28 @@ def run(cfg, system_prompt, task_message, schemas, report_key=""):
                     preview = str(result)[:200].replace("\n", " ")
                 print(f"  返回（{ms}ms）：{preview}")
                 messages.extend(to_tool_messages(c["id"], result))
+            trace.append(
+                "### 步骤 %d\n%s\n工具：%s\n" % (
+                    step, (text or "")[:400],
+                    ", ".join(c["name"] for c in calls) if calls else "无"))
         else:
             print(f"达到步数上限（{max_steps}），强制结束。")
     except Exception as e:
         print(f"\n模型调用失败：{e}")
+        if report_key and trace:
+            try:
+                reports = os.path.join(agent_dir, "reports")
+                os.makedirs(reports, exist_ok=True)
+                p = os.path.join(reports, f"{report_key}_report_PARTIAL.md")
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(f"# {report_key} —— 中断时的分析（partial，修复未完成）\n\n")
+                    f.write(f"中断原因：{e}\n\n已完成 {len(trace)} 步。\n\n")
+                    f.write("\n".join(trace))
+                    if final_text:
+                        f.write(f"\n\n## 最后的模型输出\n\n{final_text}\n")
+                print(f"已把中断前的分析存为 {p}")
+            except Exception as se:
+                print(f"（partial 报告保存失败：{se}）")
         print("请检查 config.json 里 model.base_url / api_key / model 是否正确，")
         print("接口需要是 OpenAI-compatible 的 chat/completions。")
         raise SystemExit(1)

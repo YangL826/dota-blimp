@@ -22,7 +22,7 @@
     "base_url": "https://api.meta.ai/v1",
     "model": "muse-spark-1.3"
   },
-  "project_root": "F:/claude memory/dota_blimp",
+  "project_root": "F:/workspace/dota_blimp",
   "watcher": {
     "debounce_sec": 5,
     "poll_sec": 2

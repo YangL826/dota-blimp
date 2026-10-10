@@ -22,13 +22,13 @@ agent/
 ## 上手步骤
 
 ### 1. 放进去
-把整个 `agent/` 文件夹解压到 `F:\claude memory\dota_blimp\` 下面。
+把整个 `agent/` 文件夹解压到 `F:\workspace\dota_blimp\` 下面。
 如果你的项目路径不一样，改 `config.json` 里的 `project_root`。
 
 ### 2. 装依赖（analyst 需要，watcher 不需要）
 用项目自带的 venv：
 ```
-F:\claude memory\dota_automaton\.venv\Scripts\pip.exe install requests
+F:\workspace\dota_automaton\.venv\Scripts\python.exe -m pip install requests
 ```
 
 ### 3. 跑阶段 0（零配置）
